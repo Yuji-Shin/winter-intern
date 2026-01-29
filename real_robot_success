@@ -1,0 +1,87 @@
+# rtde_tool_test1.py
+# URSim의 TCP(tool position)를 moveL로 +5cm 이동하는 최소 예제
+
+import rtde_control
+import rtde_receive
+
+HOST = "192.168.10.11"   # URSim IP
+SPEED = 0.25
+ACC = 0.5
+
+import argparse
+import logging
+import sys
+
+sys.path.append("../..")
+import rtde.rtde as rtde
+import rtde.rtde_config as rtde_config
+import rtde.csv_writer as csv_writer
+import rtde.csv_binary_writer as csv_binary_writer
+import datetime
+import time
+from rtde_control import RTDEControlInterface as RTDEControl
+from rtde_receive import RTDEReceiveInterface as RTDEReceive
+# parameters
+parser = argparse.ArgumentParser()
+parser.add_argument(
+   "--host", default="192.168.10.11", help="name of host to connect to (localhost)"
+)
+parser.add_argument("--port", type=int, default=30004, help="port number (30004)")
+parser.add_argument(
+   "--samples", type=int, default=0, help="number of samples to record"
+)
+parser.add_argument(
+   # "--frequency", type=int, default=120, help="the sampling frequency in Herz"
+   "--frequency", type=int, default=100, help="the sampling frequency in Herz"
+
+)
+parser.add_argument(
+   "--config",
+   default="record_configuration.xml",
+   help="data configuration file to use (record_configuration.xml)",
+)
+
+parser.add_argument(
+   "--output",
+   default="robot_data.csv",
+   help="data output file to write to (robot_data.csv)",
+)
+parser.add_argument("--verbose", help="increase output verbosity", action="store_true")
+parser.add_argument(
+   "--buffered",
+   help="Use buffered receive which doesn't skip data",
+   action="store_true",
+)
+parser.add_argument(
+   "--binary", help="save the data in binary format", action="store_true"
+)
+args = parser.parse_args()
+
+if args.verbose:
+   logging.basicConfig(level=logging.INFO)
+
+# Initialize RTDE interfaces
+# rtde_c = RTDEControl(args.host)
+# rtde_r = RTDEReceive(args.host)
+# current_tcp_pose = rtde_r.getActualTCPPose()
+# print(f"Current TCP Position: x={current_tcp_pose[0]}, y={current_tcp_pose[1]}, z={current_tcp_pose[2]}")
+# print(f"Current TCP Orientation: rx={current_tcp_pose[3]}, ry={current_tcp_pose[4]}, rz={current_tcp_pose[5]}")
+# exit()
+def main():
+   rtde_c = RTDEControl(args.host)
+   rtde_r = RTDEReceive(args.host)
+
+   pose = rtde_r.getActualTCPPose()  # [x,y,z,rx,ry,rz] (단위: m, rad)
+   print("current TCP pose:", pose)
+
+   target = pose.copy()
+   target[2] += 0.05  # +5cm (m)
+
+   ok = rtde_c.moveL(target, SPEED, ACC)
+   print("moveL ok:", ok)
+
+   rtde_c.stopScript()
+
+if __name__ == "__main__":
+   main()
+
