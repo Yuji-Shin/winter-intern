@@ -1,7 +1,0 @@
-[
-  {"intent":"STOP", "text":"멈춰주세요"},
-  {"intent":"PAIN", "text":"아파요 통증이 있어요"},
-  {"intent":"MOVE_SLOW", "text":"천천히 움직여주세요"},
-  {"intent":"EXPLAIN", "text":"지금 뭐 하는 거예요 설명해줘요"},
-  {"intent":"OK", "text":"괜찮아요 계속 해도 돼요"}
-]
