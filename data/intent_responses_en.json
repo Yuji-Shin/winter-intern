@@ -1,0 +1,67 @@
+{
+  "_meta": {
+    "lang": "en",
+    "note": "intent -> response policy. mode: tts | beep | silent. texts can be a list (random pick). placeholders: {heard_text}, {total_moved}"
+  },
+
+  "STOP": {
+    "mode": "beep",
+    "beep": [[880, 150], [880, 150]],
+    "texts": ["Emergency stop."]
+  },
+
+  "START": {
+    "mode": "tts",
+    "texts": [
+      "Armed. Ready.",
+      "Okay. I am ready to proceed."
+    ]
+  },
+
+  "MOVE_SLOW": {
+    "mode": "tts",
+    "texts": [
+      "Okay. I will slow down.",
+      "Understood. Moving slower."
+    ]
+  },
+
+  "EXPLAIN": {
+    "mode": "tts",
+    "texts": [
+      "I am moving the tool based on your commands.",
+      "I heard: {heard_text}. I will follow your instructions."
+    ]
+  },
+
+  "PAIN": {
+    "mode": "tts",
+    "texts": [
+      "I heard that you are in pain. I will stop and retract now.",
+      "Okay. Stopping and retracting for safety."
+    ]
+  },
+
+  "OK": {
+    "mode": "tts",
+    "texts": [
+      "Okay. Thank you. I will continue.",
+      "Understood. Continuing."
+    ]
+  },
+
+  "RULE_MOVE": {
+    "mode": "silent",
+    "texts": [
+      "Moving now."
+    ]
+  },
+
+  "SEQUENCE": {
+    "mode": "tts",
+    "texts": [
+      "Starting sequence.",
+      "Starting the routine now."
+    ]
+  }
+}
