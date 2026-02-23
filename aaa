@@ -1,0 +1,913 @@
+#!/usr/bin/env python3
+"""
+final_robot_safe_realtime.py
+Realtime Whisper (utterance-level) + (Rule move first) + MiniLM intent routing + UR RTDE control
++ CSV metrics logging
++ ✅ 실로봇 안전 강화:
+  - START로 arming 전에는 이동 불가
+  - STOP/DISARM 최우선 override
+  - 1회 이동 거리 clamp (default/max step)
+  - XYZ 작업공간 clamp
+  - ✅ RULE_MOVE는 "2차 확인(yes/no)" 후에만 실행 (pending_move)
+  - (선택) 포트 체크: 29999(dashboard), 30004(RTDE)
+
+사용 예:
+  python final_robot_safe_realtime.py --host 192.168.10.11 --device 1
+  python final_robot_safe_realtime.py --host 192.168.10.11 --dry-run
+  python final_robot_safe_realtime.py --list-devices
+"""
+
+import argparse
+import csv
+import json
+import os
+import queue
+import re
+import socket
+import threading
+import time
+from datetime import datetime
+from time import perf_counter
+from typing import Optional, Tuple
+
+import numpy as np
+import sounddevice as sd
+import whisper
+
+import rtde_control
+import rtde_receive
+
+from src.minilm import MiniLMRetriever
+from src.router import IntentRouter
+
+
+# ======================
+# Keywords / vocab
+# ======================
+STOP_KEYWORDS = ["stop", "pause", "hold on", "wait", "halt", "freeze", "emergency stop", "e stop"]
+START_KEYWORDS = ["start", "begin", "continue", "go", "resume", "arm", "enable"]
+DISARM_KEYWORDS = ["disarm", "disable", "cancel", "stand down"]
+
+# (선택) PAIN 키워드 오버라이드(초저지연)
+PAIN_KEYWORDS = ["it hurts", "hurt", "pain", "ouch"]
+
+CONFIRM_YES = ["yes", "confirm", "execute", "do it", "okay", "ok"]
+CONFIRM_NO = ["no", "cancel", "stop", "abort", "never mind"]
+
+MOVE_VERBS = ["move", "go", "shift", "translate", "slide"]
+
+DIR_WORDS = {
+    "up": ("z", +1),
+    "down": ("z", -1),
+    "left": ("y", +1),
+    "right": ("y", -1),
+    "forward": ("x", +1),
+    "back": ("x", -1),
+    "backward": ("x", -1),
+}
+
+
+# ======================
+# CSV Metrics Logger
+# ======================
+def _now_iso():
+    return datetime.now().isoformat(timespec="milliseconds")
+
+
+class MetricsCSV:
+    def __init__(self, path: str):
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        self.path = path
+        self.f = open(path, "w", newline="", encoding="utf-8")
+        self.fields = [
+            "ts",
+            "kind",  # startup / utterance
+            "step",  # load_whisper, connect_rtde, route, rule_move...
+            "utt_id",
+            "duration_ms",
+            "asr_ms",
+            "text",
+            "override_intent",
+            "chosen_intent",
+            "chosen_score",
+            "top3",
+            "note",
+        ]
+        self.w = csv.DictWriter(self.f, fieldnames=self.fields)
+        self.w.writeheader()
+        self.f.flush()
+
+    def log(self, **row):
+        base = {k: "" for k in self.fields}
+        base.update(row)
+        base["ts"] = base["ts"] or _now_iso()
+        self.w.writerow(base)
+        self.f.flush()
+
+    def close(self):
+        try:
+            self.f.close()
+        except Exception:
+            pass
+
+
+# ======================
+# Realtime Whisper helper
+# ======================
+class RealtimeWhisper:
+    """
+    마이크 스트림을 계속 받으면서 에너지 기반으로 발화를 잘라 Whisper에 넣고 text yield.
+    (토큰 스트리밍은 아니고, '발화 단위' 준실시간)
+    """
+
+    def __init__(
+        self,
+        asr_model,
+        sample_rate=16000,
+        input_device=None,
+        chunk_ms=30,
+        energy_threshold=0.012,
+        min_speech_sec=0.25,
+        end_silence_sec=0.55,
+        max_utt_sec=4.5,
+        debug_energy=False,
+        language="en",
+    ):
+        self.asr = asr_model
+        self.sr = sample_rate
+        self.device = input_device
+
+        self.chunk_ms = chunk_ms
+        self.energy_threshold = energy_threshold
+        self.min_speech_sec = min_speech_sec
+        self.end_silence_sec = end_silence_sec
+        self.max_utt_sec = max_utt_sec
+        self.debug_energy = debug_energy
+        self.language = language
+
+        self.q = queue.Queue()
+        self.stop_event = threading.Event()
+
+        self.chunk_frames = int(self.sr * (self.chunk_ms / 1000.0))
+        self.min_speech_frames = int(self.sr * self.min_speech_sec)
+        self.end_silence_frames = int(self.sr * self.end_silence_sec)
+        self.max_utt_frames = int(self.sr * self.max_utt_sec)
+
+        self._stream = None
+        self.last_asr_ms = 0.0
+
+    def _audio_cb(self, indata, frames, time_info, status):
+        if status:
+            print("[AUDIO]", status)
+        self.q.put(indata[:, 0].copy())
+
+    def start(self):
+        self.stop_event.clear()
+        self._stream = sd.InputStream(
+            samplerate=self.sr,
+            channels=1,
+            dtype="float32",
+            blocksize=self.chunk_frames,
+            device=self.device,
+            callback=self._audio_cb,
+        )
+        self._stream.start()
+
+    def stop(self):
+        self.stop_event.set()
+        if self._stream:
+            try:
+                self._stream.stop()
+            except Exception:
+                pass
+            try:
+                self._stream.close()
+            except Exception:
+                pass
+            self._stream = None
+
+    def listen_texts(self):
+        in_speech = False
+        utt = np.zeros((0,), dtype=np.float32)
+        silence = 0
+
+        while not self.stop_event.is_set():
+            try:
+                chunk = self.q.get(timeout=0.2)
+            except queue.Empty:
+                continue
+
+            rms = float(np.sqrt(np.mean(chunk * chunk) + 1e-12))
+            if self.debug_energy:
+                print(f"[RMS] {rms:.5f}")
+
+            is_speech = rms > self.energy_threshold
+
+            if is_speech:
+                in_speech = True
+                silence = 0
+                utt = np.concatenate([utt, chunk])
+
+                if len(utt) > self.max_utt_frames:
+                    text = self._transcribe_utt(utt)
+                    if text:
+                        yield text
+                    utt = np.zeros((0,), dtype=np.float32)
+                    in_speech = False
+                    silence = 0
+            else:
+                if in_speech:
+                    silence += len(chunk)
+                    utt = np.concatenate([utt, chunk])
+                    if silence >= self.end_silence_frames:
+                        if len(utt) >= self.min_speech_frames:
+                            text = self._transcribe_utt(utt)
+                            if text:
+                                yield text
+                        utt = np.zeros((0,), dtype=np.float32)
+                        in_speech = False
+                        silence = 0
+
+    def _transcribe_utt(self, audio_1d: np.ndarray) -> str:
+        t0 = perf_counter()
+        result = self.asr.transcribe(
+            audio_1d,
+            language=self.language,
+            fp16=False,
+            beam_size=1,
+            best_of=1,
+            temperature=0.0,
+            condition_on_previous_text=False,
+            verbose=False,
+        )
+        self.last_asr_ms = (perf_counter() - t0) * 1000.0
+        return (result.get("text") or "").strip()
+
+
+# ======================
+# Utility / helpers
+# ======================
+def list_audio_devices():
+    print("\n=== sounddevice input devices ===")
+    devs = sd.query_devices()
+    for i, d in enumerate(devs):
+        if d.get("max_input_channels", 0) > 0:
+            print(f"[{i}] {d['name']}  (inputs={d['max_input_channels']})")
+    print("=================================\n")
+
+
+def load_intent_bank(path: str):
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def tcp_connectable(host: str, port: int, timeout_s: float = 1.5) -> bool:
+    try:
+        with socket.create_connection((host, port), timeout=timeout_s):
+            return True
+    except Exception:
+        return False
+
+
+def override_safety(text: str) -> Optional[str]:
+    t = text.lower()
+
+    # 초저지연 PAIN
+    if any(k in t for k in PAIN_KEYWORDS):
+        return "PAIN"
+
+    if any(k in t for k in STOP_KEYWORDS):
+        return "STOP"
+    if any(k in t for k in DISARM_KEYWORDS):
+        return "DISARM"
+    if any(k in t for k in START_KEYWORDS):
+        return "START"
+
+    # confirm words (pending 처리에서 따로 보지만, 필요하면 여기서도 확인 가능)
+    return None
+
+
+def extract_distance_m_clamped(text: str, default_m: float, max_step_m: float) -> float:
+    """
+    거리 추출(mm/cm/m) + 0~max_step_m clamp
+    """
+    t = text.lower()
+
+    m = re.search(r"(\d+(\.\d+)?)\s*(mm|millimeter|millimeters)\b", t)
+    if m:
+        val = float(m.group(1)) / 1000.0
+        return float(np.clip(val, 0.0, max_step_m))
+
+    m = re.search(r"(\d+(\.\d+)?)\s*(cm|centimeter|centimeters)\b", t)
+    if m:
+        val = float(m.group(1)) / 100.0
+        return float(np.clip(val, 0.0, max_step_m))
+
+    m = re.search(r"(\d+(\.\d+)?)\s*(m|meter|meters)\b", t)
+    if m:
+        val = float(m.group(1))
+        return float(np.clip(val, 0.0, max_step_m))
+
+    return float(np.clip(default_m, 0.0, max_step_m))
+
+
+def parse_move_command(
+    text: str,
+    default_step_m: float,
+    max_step_m: float,
+    require_move_verb: bool = True,
+) -> Optional[Tuple[float, float, float, str, float]]:
+    """
+    "move up 5 cm" 같은 규칙 기반 이동 명령 파싱.
+    성공하면 (dx,dy,dz, found_dir, dist_m) 반환, 아니면 None.
+    """
+    t = text.lower()
+
+    found_dir = None
+    for w in DIR_WORDS.keys():
+        if re.search(rf"\b{re.escape(w)}\b", t):
+            found_dir = w
+            break
+    if not found_dir:
+        return None
+
+    if require_move_verb:
+        has_move_verb = any(re.search(rf"\b{re.escape(v)}\b", t) for v in MOVE_VERBS)
+        if not has_move_verb:
+            return None
+
+    axis, sign = DIR_WORDS[found_dir]
+    dist_m = extract_distance_m_clamped(t, default_m=default_step_m, max_step_m=max_step_m)
+
+    dx = dy = dz = 0.0
+    if axis == "x":
+        dx = sign * dist_m
+    elif axis == "y":
+        dy = sign * dist_m
+    else:
+        dz = sign * dist_m
+
+    return dx, dy, dz, found_dir, dist_m
+
+
+def clamp_pose_xyz(pose, xyz_limits):
+    pose[0] = float(np.clip(pose[0], xyz_limits["x"][0], xyz_limits["x"][1]))
+    pose[1] = float(np.clip(pose[1], xyz_limits["y"][0], xyz_limits["y"][1]))
+    pose[2] = float(np.clip(pose[2], xyz_limits["z"][0], xyz_limits["z"][1]))
+    return pose
+
+
+def safe_stop(rtde_c) -> bool:
+    try:
+        rtde_c.stopL(2.0)
+        return True
+    except Exception:
+        try:
+            rtde_c.stopJ(2.0)
+            return True
+        except Exception:
+            return False
+
+
+def moveL_delta(rtde_c, rtde_r, dx, dy, dz, speed, acc, xyz_limits, dry_run: bool):
+    pose = rtde_r.getActualTCPPose()
+    print("current TCP pose:", pose)
+
+    target = pose.copy()
+    target[0] += float(dx)
+    target[1] += float(dy)
+    target[2] += float(dz)
+    target = clamp_pose_xyz(target, xyz_limits)
+
+    print("target  TCP pose:", target)
+
+    if dry_run:
+        print("[DRY_RUN] skip moveL")
+        return True
+
+    ok = rtde_c.moveL(target, speed, acc)
+    return ok
+
+
+def handle_intent(intent: str, rtde_c, rtde_r, state, base_speed, base_acc, pain_retract_z_m, xyz_limits, dry_run):
+    """
+    intent -> 로봇 동작/상태 변경
+    state: dict (armed, speed_scale, pending_move...)
+    """
+    intent = (intent or "").upper()
+
+    if intent in ("STOP", "DISARM"):
+        print("[INTENT] STOP/DISARM -> stopping + disarming")
+        safe_stop(rtde_c)
+        state["armed"] = False
+        state["pending_move"] = None
+        return
+
+    if intent == "START":
+        state["armed"] = True
+        print("[INTENT] START -> ARMED=True")
+        return
+
+    if intent == "PAIN":
+        print("[INTENT] PAIN -> stop + retract(up) + disarm")
+        safe_stop(rtde_c)
+        time.sleep(0.1)
+
+        retract_speed = base_speed * 0.5
+        retract_acc = base_acc * 0.5
+        ok = moveL_delta(rtde_c, rtde_r, 0.0, 0.0, +pain_retract_z_m, retract_speed, retract_acc, xyz_limits, dry_run)
+        print("retract ok:", ok)
+
+        state["armed"] = False
+        state["pending_move"] = None
+        return
+
+    if intent == "MOVE_SLOW":
+        state["speed_scale"] = 0.5
+        print("[INTENT] MOVE_SLOW -> speed_scale=0.5")
+        return
+
+    if intent == "OK":
+        state["speed_scale"] = 1.0
+        print("[INTENT] OK -> speed_scale=1.0")
+        return
+
+    if intent == "EXPLAIN":
+        print("[INTENT] EXPLAIN -> (print) I am moving the tool based on your commands.")
+        return
+
+    print("[INTENT] Unknown/Unhandled:", intent)
+
+
+def top3_str(candidates):
+    try:
+        return " | ".join([f"{c['intent']}:{c['score']:.3f}" for c in candidates[:3]])
+    except Exception:
+        return ""
+
+
+def make_rtde_control(host: str, use_urcap: bool):
+    """
+    환경에 따라 flags 인자가 없을 수도 있어서 안전하게 생성.
+    """
+    if use_urcap and hasattr(rtde_control, "FLAG_USE_EXT_UR_CAP"):
+        return rtde_control.RTDEControlInterface(host, flags=rtde_control.FLAG_USE_EXT_UR_CAP)
+    return rtde_control.RTDEControlInterface(host)
+
+
+# ======================
+# main
+# ======================
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--host", default="127.0.0.1", help="Robot/URSim controller IP")
+    parser.add_argument("--use-urcap", action="store_true", help="Use External Control URCap flag if available")
+    parser.add_argument("--dry-run", action="store_true", help="Do not execute moveL, only print target pose")
+
+    parser.add_argument("--list-devices", action="store_true", help="List audio input devices and exit")
+    parser.add_argument("--device", type=int, default=None, help="sounddevice input device index (None=default)")
+
+    parser.add_argument("--sr", type=int, default=16000, help="Sample rate")
+    parser.add_argument("--model", default="base.en", help="Whisper model (tiny.en/base.en/...)")
+    parser.add_argument("--lang", default="en", help="Whisper language")
+
+    parser.add_argument("--chunk-ms", type=int, default=30, help="20~50ms recommended")
+    parser.add_argument("--energy", type=float, default=0.012, help="RMS threshold")
+    parser.add_argument("--min-speech", type=float, default=0.25)
+    parser.add_argument("--end-silence", type=float, default=0.55)
+    parser.add_argument("--max-utt", type=float, default=4.5)
+    parser.add_argument("--debug-energy", action="store_true")
+
+    parser.add_argument("--intent-bank", default="data/intent_bank_en.json")
+    parser.add_argument("--threshold", type=float, default=0.55)
+
+    parser.add_argument("--speed", type=float, default=0.05, help="moveL speed (m/s) - 실로봇은 낮게 시작 추천")
+    parser.add_argument("--acc", type=float, default=0.10, help="moveL acc (m/s^2) - 실로봇은 낮게 시작 추천")
+    parser.add_argument("--pain-retract", type=float, default=0.03, help="PAIN retract Z (m)")
+
+    parser.add_argument("--default-step", type=float, default=0.01, help="Default step if distance not spoken (m)")
+    parser.add_argument("--max-step", type=float, default=0.02, help="Clamp max step per move (m)")
+    parser.add_argument("--require-move-verb", action="store_true", help="Require move/go/... verb for rule move parsing")
+
+    parser.add_argument("--confirm-timeout", type=float, default=3.0, help="Seconds to wait for yes/no after parsing a move")
+
+    # XYZ limits
+    parser.add_argument("--x-min", type=float, default=-1.0)
+    parser.add_argument("--x-max", type=float, default=+1.0)
+    parser.add_argument("--y-min", type=float, default=-1.0)
+    parser.add_argument("--y-max", type=float, default=+1.0)
+    parser.add_argument("--z-min", type=float, default=0.0)
+    parser.add_argument("--z-max", type=float, default=1.2)
+
+    args = parser.parse_args()
+
+    if args.list_devices:
+        list_audio_devices()
+        return
+
+    xyz_limits = {
+        "x": (args.x_min, args.x_max),
+        "y": (args.y_min, args.y_max),
+        "z": (args.z_min, args.z_max),
+    }
+
+    metrics = None
+    listener = None
+    rtde_c = None
+    rtde_r = None
+
+    try:
+        metrics_path = os.path.join("logs", f"metrics_{datetime.now():%Y%m%d_%H%M%S}.csv")
+        metrics = MetricsCSV(metrics_path)
+        metrics.log(kind="startup", step="start", duration_ms=0, note=f"csv={metrics_path}")
+
+        print("=== CONFIG ===")
+        print("HOST:", args.host, "| use_urcap:", args.use_urcap)
+        print("DRY_RUN:", args.dry_run)
+        print("Audio device:", args.device, "| sr:", args.sr)
+        print("Whisper model:", args.model, "| lang:", args.lang)
+        print("chunk_ms:", args.chunk_ms, "| energy:", args.energy, "| debug_energy:", args.debug_energy)
+        print("speed/acc:", args.speed, args.acc, "| pain_retract:", args.pain_retract)
+        print("default_step/max_step:", args.default_step, args.max_step, "| require_move_verb:", args.require_move_verb)
+        print("confirm_timeout:", args.confirm_timeout)
+        print("XYZ limits:", xyz_limits)
+        print("intent bank:", args.intent_bank, "| threshold:", args.threshold)
+        print("=============\n")
+
+        # (추천) 포트 체크
+        print("[NET] Checking ports ...")
+        dash_ok = tcp_connectable(args.host, 29999, timeout_s=1.5)
+        rtde_ok = tcp_connectable(args.host, 30004, timeout_s=1.5)
+        print(f"[NET] {args.host}:29999 dashboard -> {'OK' if dash_ok else 'FAIL'}")
+        print(f"[NET] {args.host}:30004 RTDE      -> {'OK' if rtde_ok else 'FAIL'}\n")
+        metrics.log(kind="startup", step="net_check", duration_ms=0, note=f"29999={dash_ok},30004={rtde_ok}")
+
+        # ASR 로드
+        print("[ASR] Loading Whisper:", args.model)
+        t0 = perf_counter()
+        asr = whisper.load_model(args.model)
+        metrics.log(kind="startup", step="load_whisper", duration_ms=(perf_counter() - t0) * 1000.0, note=args.model)
+
+        # NLU 로드
+        print("[NLU] Loading intent bank + MiniLM retriever/router...")
+        t0 = perf_counter()
+        intent_bank = load_intent_bank(args.intent_bank)
+        metrics.log(kind="startup", step="load_intent_bank", duration_ms=(perf_counter() - t0) * 1000.0, note=args.intent_bank)
+
+        t0 = perf_counter()
+        retriever = MiniLMRetriever(intent_bank)
+        router = IntentRouter(retriever, threshold=args.threshold)
+        metrics.log(
+            kind="startup",
+            step="init_minilm_router",
+            duration_ms=(perf_counter() - t0) * 1000.0,
+            note=f"threshold={args.threshold}",
+        )
+
+        # RTDE 연결
+        print("[RTDE] Connecting to:", args.host)
+        t0 = perf_counter()
+        rtde_c = make_rtde_control(args.host, use_urcap=args.use_urcap)
+        rtde_r = rtde_receive.RTDEReceiveInterface(args.host)
+        metrics.log(kind="startup", step="connect_rtde", duration_ms=(perf_counter() - t0) * 1000.0, note=args.host)
+
+        state = {
+            "armed": False,
+            "speed_scale": 1.0,
+            "pending_move": None,  # (dx,dy,dz,dir,dist_m,orig_text)
+            "pending_t0": 0.0,
+        }
+
+        print(
+            "\nRealtime listening... (Ctrl+C to quit)\n"
+            "- Say 'start' to arm\n"
+            "- Say 'stop' to stop+disarm\n"
+            "- Say 'disarm' to disarm\n"
+            "- Say 'it hurts' to trigger PAIN behavior\n"
+            "- Try: 'move up 5 mm', 'move forward 1 cm'\n"
+            "- ✅ RULE_MOVE는 파싱 후 'yes/confirm'을 말해야 실행됩니다.\n"
+        )
+
+        listener = RealtimeWhisper(
+            asr,
+            sample_rate=args.sr,
+            input_device=args.device,
+            chunk_ms=args.chunk_ms,
+            energy_threshold=args.energy,
+            min_speech_sec=args.min_speech,
+            end_silence_sec=args.end_silence,
+            max_utt_sec=args.max_utt,
+            debug_energy=args.debug_energy,
+            language=args.lang,
+        )
+        listener.start()
+
+        utt_id = 0
+
+        for text in listener.listen_texts():
+            utt_id += 1
+            asr_ms = float(getattr(listener, "last_asr_ms", 0.0) or 0.0)
+
+            print("[TEXT]", text if text else "(empty)")
+            if not text:
+                metrics.log(kind="utterance", step="empty_text", utt_id=utt_id, duration_ms=0, asr_ms=asr_ms, text="")
+                continue
+
+            tl = text.lower()
+
+            # 1) 안전 키워드 override 최우선
+            t0 = perf_counter()
+            ov = override_safety(text)
+            ov_ms = (perf_counter() - t0) * 1000.0
+            if ov:
+                t1 = perf_counter()
+                handle_intent(
+                    ov,
+                    rtde_c,
+                    rtde_r,
+                    state,
+                    base_speed=args.speed,
+                    base_acc=args.acc,
+                    pain_retract_z_m=args.pain_retract,
+                    xyz_limits=xyz_limits,
+                    dry_run=args.dry_run,
+                )
+                act_ms = (perf_counter() - t1) * 1000.0
+                metrics.log(
+                    kind="utterance",
+                    step="override",
+                    utt_id=utt_id,
+                    duration_ms=f"{ov_ms:.3f}",
+                    asr_ms=f"{asr_ms:.3f}",
+                    text=text,
+                    override_intent=ov,
+                    chosen_intent=ov,
+                    note=f"action_ms={act_ms:.3f}, armed={state['armed']}, speed_scale={state['speed_scale']}",
+                )
+                print("[STATE]", state, "\n")
+                continue
+
+            # 2) pending move 확인 단계(yes/no)
+            if state.get("pending_move") is not None:
+                # timeout
+                if (perf_counter() - state["pending_t0"]) > float(args.confirm_timeout):
+                    print("[CONFIRM] timeout -> cancel pending move\n")
+                    metrics.log(
+                        kind="utterance",
+                        step="pending_timeout_cancel",
+                        utt_id=utt_id,
+                        duration_ms=0,
+                        asr_ms=f"{asr_ms:.3f}",
+                        text=text,
+                        chosen_intent="PENDING_CANCEL",
+                        note="timeout",
+                    )
+                    state["pending_move"] = None
+                    continue
+
+                if any(k in tl for k in CONFIRM_NO):
+                    print("[CONFIRM] canceled\n")
+                    metrics.log(
+                        kind="utterance",
+                        step="pending_cancel",
+                        utt_id=utt_id,
+                        duration_ms=0,
+                        asr_ms=f"{asr_ms:.3f}",
+                        text=text,
+                        chosen_intent="PENDING_CANCEL",
+                        note="user_said_no",
+                    )
+                    state["pending_move"] = None
+                    continue
+
+                if any(k in tl for k in CONFIRM_YES):
+                    if not state["armed"]:
+                        print("[BLOCKED] Not armed. Say 'start' first.\n")
+                        metrics.log(
+                            kind="utterance",
+                            step="pending_confirm_blocked_not_armed",
+                            utt_id=utt_id,
+                            duration_ms=0,
+                            asr_ms=f"{asr_ms:.3f}",
+                            text=text,
+                            chosen_intent="PENDING_CONFIRM",
+                            note="blocked:not_armed",
+                        )
+                        state["pending_move"] = None
+                        continue
+
+                    dx, dy, dz, found_dir, dist_m, orig_text = state["pending_move"]
+                    state["pending_move"] = None
+
+                    speed = args.speed * state["speed_scale"]
+                    acc = args.acc * state["speed_scale"]
+
+                    print(f"[CONFIRMED] executing move: dir={found_dir} dist={dist_m:.3f}m")
+                    t1 = perf_counter()
+                    ok = moveL_delta(rtde_c, rtde_r, dx, dy, dz, speed, acc, xyz_limits, args.dry_run)
+                    move_ms = (perf_counter() - t1) * 1000.0
+
+                    metrics.log(
+                        kind="utterance",
+                        step="rule_move_confirmed",
+                        utt_id=utt_id,
+                        duration_ms=f"{move_ms:.3f}",
+                        asr_ms=f"{asr_ms:.3f}",
+                        text=orig_text,
+                        chosen_intent="RULE_MOVE",
+                        note=f"confirmed_by={text} ok={ok} dx={dx:.3f} dy={dy:.3f} dz={dz:.3f} speed={speed:.3f}",
+                    )
+
+                    print("moveL ok:", ok, "\n")
+                    continue
+
+                # yes/no가 아니면, 안전을 위해 pending 유지하고 다른 행동은 하지 않음
+                print("[CONFIRM] Waiting for 'yes/confirm' or 'no/cancel'...\n")
+                metrics.log(
+                    kind="utterance",
+                    step="pending_wait",
+                    utt_id=utt_id,
+                    duration_ms=0,
+                    asr_ms=f"{asr_ms:.3f}",
+                    text=text,
+                    chosen_intent="PENDING_WAIT",
+                    note="not_yes_no",
+                )
+                continue
+
+            # 3) 규칙 기반 move 파싱(먼저) -> pending으로 보관
+            t0 = perf_counter()
+            parsed = parse_move_command(
+                text,
+                default_step_m=float(args.default_step),
+                max_step_m=float(args.max_step),
+                require_move_verb=bool(args.require_move_verb),
+            )
+            parse_ms = (perf_counter() - t0) * 1000.0
+
+            if parsed:
+                if not state["armed"]:
+                    metrics.log(
+                        kind="utterance",
+                        step="rule_move_blocked_not_armed",
+                        utt_id=utt_id,
+                        duration_ms=f"{parse_ms:.3f}",
+                        asr_ms=f"{asr_ms:.3f}",
+                        text=text,
+                        chosen_intent="RULE_MOVE",
+                        note="blocked:not_armed",
+                    )
+                    print("[BLOCKED] Not armed. Say 'start' first.\n")
+                    continue
+
+                dx, dy, dz, found_dir, dist_m = parsed
+                state["pending_move"] = (dx, dy, dz, found_dir, dist_m, text)
+                state["pending_t0"] = perf_counter()
+
+                metrics.log(
+                    kind="utterance",
+                    step="rule_move_parsed_pending",
+                    utt_id=utt_id,
+                    duration_ms=f"{parse_ms:.3f}",
+                    asr_ms=f"{asr_ms:.3f}",
+                    text=text,
+                    chosen_intent="RULE_MOVE_PENDING",
+                    note=f"dir={found_dir} dist={dist_m:.3f} dx={dx:.3f} dy={dy:.3f} dz={dz:.3f}",
+                )
+
+                print(f"[RULE_MOVE] Parsed dir={found_dir} dist={dist_m:.3f}m -> dx={dx:.3f} dy={dy:.3f} dz={dz:.3f}")
+                print("[CONFIRM] Say 'yes/confirm' to execute, or 'no/cancel' to abort.\n")
+                continue
+
+            # 4) MiniLM intent 라우팅
+            t0 = perf_counter()
+            chosen, candidates = router.route(text)
+            route_ms = (perf_counter() - t0) * 1000.0
+            top3 = top3_str(candidates)
+
+            print("\n[Top-3 candidates]")
+            for c in candidates[:3]:
+                print(f"- {c['intent']:10s} score={c['score']:.3f} ({c['text']})")
+
+            if not chosen:
+                metrics.log(
+                    kind="utterance",
+                    step="route_no_intent",
+                    utt_id=utt_id,
+                    duration_ms=f"{route_ms:.3f}",
+                    asr_ms=f"{asr_ms:.3f}",
+                    text=text,
+                    top3=top3,
+                    note="below_threshold",
+                )
+                print("\n[NO_INTENT] below threshold\n")
+                continue
+
+            intent = chosen["intent"]
+            score = chosen.get("score", "")
+
+            print("\n[CHOSEN]", chosen)
+
+            # 안전 intent는 armed 여부와 관계 없이 처리
+            if intent in ["PAIN", "STOP", "START", "DISARM"]:
+                t1 = perf_counter()
+                handle_intent(
+                    intent,
+                    rtde_c,
+                    rtde_r,
+                    state,
+                    base_speed=args.speed,
+                    base_acc=args.acc,
+                    pain_retract_z_m=args.pain_retract,
+                    xyz_limits=xyz_limits,
+                    dry_run=args.dry_run,
+                )
+                act_ms = (perf_counter() - t1) * 1000.0
+
+                metrics.log(
+                    kind="utterance",
+                    step="route_intent_safety",
+                    utt_id=utt_id,
+                    duration_ms=f"{route_ms:.3f}",
+                    asr_ms=f"{asr_ms:.3f}",
+                    text=text,
+                    chosen_intent=intent,
+                    chosen_score=score,
+                    top3=top3,
+                    note=f"action_ms={act_ms:.3f}, armed={state['armed']}, speed_scale={state['speed_scale']}",
+                )
+
+                print("[STATE]", state, "\n")
+                continue
+
+            # 나머지는 start(armed) 이후에만 실행
+            if not state["armed"]:
+                metrics.log(
+                    kind="utterance",
+                    step="route_intent_blocked_not_armed",
+                    utt_id=utt_id,
+                    duration_ms=f"{route_ms:.3f}",
+                    asr_ms=f"{asr_ms:.3f}",
+                    text=text,
+                    chosen_intent=intent,
+                    chosen_score=score,
+                    top3=top3,
+                    note="blocked:not_armed",
+                )
+                print("[BLOCKED] Not armed. Say 'start' first.\n")
+                continue
+
+            t1 = perf_counter()
+            handle_intent(
+                intent,
+                rtde_c,
+                rtde_r,
+                state,
+                base_speed=args.speed,
+                base_acc=args.acc,
+                pain_retract_z_m=args.pain_retract,
+                xyz_limits=xyz_limits,
+                dry_run=args.dry_run,
+            )
+            act_ms = (perf_counter() - t1) * 1000.0
+
+            metrics.log(
+                kind="utterance",
+                step="route_intent",
+                utt_id=utt_id,
+                duration_ms=f"{route_ms:.3f}",
+                asr_ms=f"{asr_ms:.3f}",
+                text=text,
+                chosen_intent=intent,
+                chosen_score=score,
+                top3=top3,
+                note=f"action_ms={act_ms:.3f}, armed={state['armed']}, speed_scale={state['speed_scale']}",
+            )
+
+            print("[STATE]", state, "\n")
+
+    except KeyboardInterrupt:
+        print("\n[QUIT] Ctrl+C")
+        if metrics:
+            metrics.log(kind="startup", step="keyboard_interrupt", duration_ms=0)
+    except Exception as e:
+        print("\n[ERROR]", repr(e))
+        if metrics:
+            metrics.log(kind="startup", step="exception", duration_ms=0, note=repr(e))
+        raise
+    finally:
+        if listener:
+            listener.stop()
+        if rtde_c:
+            try:
+                rtde_c.stopScript()
+            except Exception:
+                pass
+        if metrics:
+            metrics.log(kind="startup", step="end", duration_ms=0)
+            metrics.close()
+        print("[RTDE] Closed")
+
+
+if __name__ == "__main__":
+    main()
