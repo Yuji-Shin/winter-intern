@@ -1,0 +1,463 @@
+#!/usr/bin/env python3
+"""
+voice_rtde_whisper_moveL_robot_safe.py
+- Whisper로 음성 -> 텍스트
+- 닫힌 어휘 파싱(move up/down/left/right/forward/back + (거리))
+- UR/URSim을 RTDE moveL로 TCP 포즈를 Δ만큼 이동
+
+필수 설치:
+  pip install openai-whisper sounddevice numpy ur-rtde
+
+실로봇 주의(중요):
+- HOST는 "로봇 컨트롤러 IP"로 설정 (127.0.0.1 거의 불가)
+- 로봇에서 Remote Control/Remote 모드 허용이 필요할 수 있음
+- 처음에는 DRY_RUN=True, 낮은 SPEED/ACC로 테스트 권장
+- E-Stop 접근 가능한 상태에서만 테스트
+
+사용 예:
+  python voice_rtde_whisper_moveL_robot_safe.py --host 192.168.10.11 --dry-run
+  python voice_rtde_whisper_moveL_robot_safe.py --host 192.168.10.11 --device 1 --model base.en
+"""
+
+import argparse
+import re
+import socket
+import time
+from typing import Optional, Tuple
+
+import numpy as np
+import whisper
+import os
+# os.environ['LD_LIBRARY_PATH'] = '/home/vboxuser/PycharmProjects/RTDE_Qian/LLM_project/LLM_project/portaudio/lib/.libs:' + os.environ.get('LD_LIBRARY_PATH', '')
+import sounddevice as sd
+
+# model_path = "/home/vboxuser/PycharmProjects/RTDE_Qian/LLM_project/LLM_project/base.en.pt"
+# asr = whisper.load_model(model_path)
+# model = whisper.load_model("base.en")
+import rtde_control
+import rtde_receive
+# sd._devices_backend = 'alsa'
+print(sd.query_devices())
+
+# print(sd.default.backend)
+# print(sd.get_portaudio_version())
+# print(sd.query_hostapis())
+# exit()
+# run this before run your code
+# export LD_LIBRARY_PATH=/home/vboxuser/PycharmProjects/RTDE_Qian/LLM_project/LLM_project/portaudio/lib/.libs:$LD_LIBRARY_PATH
+# ======================
+# Closed-vocab settings
+# ======================
+STOP_KEYWORDS  = ["stop", "pause", "hold on", "wait", "halt", "freeze", "emergency stop", "e stop"]
+START_KEYWORDS = ["start", "begin", "continue", "go", "resume", "arm", "enable"]
+DISARM_KEYWORDS = ["disarm", "disable", "cancel"]
+
+CONFIRM_YES = ["yes", "confirm", "execute", "do it", "okay", "ok"]
+CONFIRM_NO  = ["no", "cancel", "stop", "abort", "never mind"]
+
+MOVE_VERBS = ["move", "go", "shift", "translate", "slide"]
+
+# 방향 단어(기본 맵핑: base 좌표계 기준 가정)
+# 설치/로봇 방향에 따라 반대로 느껴질 수 있어 --invert-x / --invert-y 옵션 제공
+DIR_WORDS = {
+    "up":       ("z", +1),
+    "down":     ("z", -1),
+    "left":     ("y", +1),
+    "right":    ("y", -1),
+    "forward":  ("x", +1),
+    "back":     ("x", -1),
+    "backward": ("x", -1),
+}
+
+DEFAULT_XYZ_LIMITS = {
+    "x": (-1.0, 1.0),
+    "y": (-1.0, 1.0),
+    "z": ( 0.0, 1.2),
+}
+
+
+# ======================
+# Utility
+# ======================
+def list_audio_devices():
+    print("\n=== sounddevice input devices ===")
+    devs = sd.query_devices()
+    for i, d in enumerate(devs):
+        if d.get("max_input_channels", 0) > 0:
+            print(f"[{i}] {d['name']}  (inputs={d['max_input_channels']})")
+    print("=================================\n")
+
+
+def record_audio(seconds: float, sample_rate: int, device: Optional[int]) -> np.ndarray:
+    print(f"[REC] Speak now ({seconds:.1f}s)...")
+    audio = sd.rec(
+        int(seconds * sample_rate),
+        samplerate=sample_rate,
+        channels=1,
+        dtype="float32",
+        device=device,
+    )
+    sd.wait()
+    return audio.squeeze()
+
+
+def contains_any(text: str, keywords) -> bool:
+    t = text.lower()
+    return any(k in t for k in keywords)
+
+
+def override_safety(text: str) -> Optional[str]:
+    t = text.lower()
+    if contains_any(t, STOP_KEYWORDS):
+        return "STOP"
+    if contains_any(t, DISARM_KEYWORDS):
+        return "DISARM"
+    if contains_any(t, START_KEYWORDS):
+        return "START"
+    return None
+
+
+def extract_distance_m(text: str, default_m: float, max_step_m: float) -> float:
+    """
+    거리 추출 지원:
+    - "5 cm", "10 centimeters", "0.05 m", "50 mm"
+    - 없으면 default_m
+    - 0 ~ max_step_m로 clamp
+    """
+    t = text.lower()
+
+    # mm
+    m = re.search(r"(\d+(\.\d+)?)\s*(mm|millimeter|millimeters)\b", t)
+    if m:
+        val = float(m.group(1)) / 1000.0
+        return float(np.clip(val, 0.0, max_step_m))
+
+    # cm
+    m = re.search(r"(\d+(\.\d+)?)\s*(cm|centimeter|centimeters)\b", t)
+    if m:
+        val = float(m.group(1)) / 100.0
+        return float(np.clip(val, 0.0, max_step_m))
+
+    # m
+    m = re.search(r"(\d+(\.\d+)?)\s*(m|meter|meters)\b", t)
+    if m:
+        val = float(m.group(1))
+        return float(np.clip(val, 0.0, max_step_m))
+
+    return float(np.clip(default_m, 0.0, max_step_m))
+
+
+def parse_closed_vocab_command(
+    text: str,
+    default_step_m: float,
+    max_step_m: float,
+    require_move_verb: bool,
+    invert_x: bool,
+    invert_y: bool,
+    invert_z: bool,
+) -> Optional[Tuple[float, float, float, str, float]]:
+    """
+    반환:
+      (dx, dy, dz, found_dir, dist_m) or None
+    """
+    t = text.lower()
+
+    found_dir = None
+    for w in DIR_WORDS.keys():
+        if re.search(rf"\b{re.escape(w)}\b", t):
+            found_dir = w
+            break
+    if not found_dir:
+        return None
+
+    if require_move_verb:
+        has_move_verb = any(re.search(rf"\b{re.escape(v)}\b", t) for v in MOVE_VERBS)
+        if not has_move_verb:
+            return None
+
+    axis, sign = DIR_WORDS[found_dir]
+    dist_m = extract_distance_m(t, default_m=default_step_m, max_step_m=max_step_m)
+
+    # invert options
+    if axis == "x" and invert_x:
+        sign *= -1
+    if axis == "y" and invert_y:
+        sign *= -1
+    if axis == "z" and invert_z:
+        sign *= -1
+
+    dx = dy = dz = 0.0
+    if axis == "x":
+        dx = sign * dist_m
+    elif axis == "y":
+        dy = sign * dist_m
+    elif axis == "z":
+        dz = sign * dist_m
+
+    return (dx, dy, dz, found_dir, dist_m)
+
+
+def clamp_pose_xyz(target_pose, xyz_limits):
+    x, y, z = target_pose[0], target_pose[1], target_pose[2]
+    x = float(np.clip(x, xyz_limits["x"][0], xyz_limits["x"][1]))
+    y = float(np.clip(y, xyz_limits["y"][0], xyz_limits["y"][1]))
+    z = float(np.clip(z, xyz_limits["z"][0], xyz_limits["z"][1]))
+    target_pose[0], target_pose[1], target_pose[2] = x, y, z
+    return target_pose
+
+
+def tcp_connectable(host: str, port: int, timeout_s: float = 1.5) -> bool:
+    try:
+        with socket.create_connection((host, port), timeout=timeout_s):
+            return True
+    except Exception:
+        return False
+
+
+def safe_stop(rtde_c) -> bool:
+    """가능하면 즉시 멈춤."""
+    try:
+        rtde_c.stopL(2.0)
+        return True
+    except Exception:
+        try:
+            rtde_c.stopJ(2.0)
+            return True
+        except Exception:
+            return False
+
+
+def moveL_delta(rtde_c, rtde_r, dx, dy, dz, speed, acc, xyz_limits, dry_run: bool):
+    pose = rtde_r.getActualTCPPose()
+    print("current TCP pose:", pose)
+
+    target = pose.copy()
+    target[0] += float(dx)
+    target[1] += float(dy)
+    target[2] += float(dz)
+
+    target = clamp_pose_xyz(target, xyz_limits)
+    print("target  TCP pose:", target)
+
+    if dry_run:
+        print("[DRY_RUN] skip moveL")
+        return True
+
+    ok = rtde_c.moveL(target, speed, acc)
+    return ok
+
+
+def transcribe_once(asr, audio: np.ndarray, language: str = "en") -> str:
+    result = asr.transcribe(audio, language=language, fp16=False)
+    text = (result.get("text") or "").strip()
+    return text
+
+
+def confirm_step(asr, sample_rate: int, device: Optional[int], seconds: float = 2.0) -> Optional[bool]:
+    """
+    음성으로 YES/NO 확인.
+    반환:
+      True  -> 실행
+      False -> 취소
+      None  -> 불명확
+    """
+    audio = record_audio(seconds, sample_rate, device)
+    text = transcribe_once(asr, audio, language="en").lower()
+    print("[CONFIRM TEXT]", text if text else "(empty)")
+
+    if any(k in text for k in CONFIRM_YES):
+        return True
+    if any(k in text for k in CONFIRM_NO):
+        return False
+    return None
+
+
+def make_rtde_control(host: str, use_urcap: bool):
+    """
+    환경에 따라 flags 인자가 없을 수도 있어서 안전하게 생성.
+    """
+    if use_urcap and hasattr(rtde_control, "FLAG_USE_EXT_UR_CAP"):
+        return rtde_control.RTDEControlInterface(host, flags=rtde_control.FLAG_USE_EXT_UR_CAP)
+    return rtde_control.RTDEControlInterface(host)
+
+
+# ======================
+# Main
+# ======================
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--host", default="192.168.10.11", help="Robot/URSim IP")
+    parser.add_argument("--speed", type=float, default=0.05, help="moveL speed (m/s) - 실로봇은 낮게 시작 추천")
+    parser.add_argument("--acc", type=float, default=0.1, help="moveL acceleration (m/s^2) - 실로봇은 낮게 시작 추천")
+    parser.add_argument("--dry-run", action="store_true", help="Do not execute moveL, only print target pose")
+
+    parser.add_argument("--device", type=int, default=None, help="Input audio device index (sounddevice)")
+    parser.add_argument("--list-devices", action="store_true", help="List audio input devices and exit")
+    parser.add_argument("--sr", type=int, default=16000, help="Sample rate")
+    parser.add_argument("--rec-seconds", type=float, default=3.5, help="Recording seconds for command")
+    parser.add_argument("--model", default="base.en", help="Whisper model (e.g., tiny.en, base.en)")
+    parser.add_argument("--lang", default="en", help="Whisper language")
+
+    parser.add_argument("--default-step", type=float, default=0.02, help="Default step (m) if distance not spoken")
+    parser.add_argument("--max-step", type=float, default=0.02, help="Clamp max step per command (m)")
+
+    parser.add_argument("--require-move-verb", action="store_true",
+                        help="Require a move verb (move/go/shift/...) to reduce false triggers")
+
+    parser.add_argument("--invert-x", action="store_true")
+    parser.add_argument("--invert-y", action="store_true")
+    parser.add_argument("--invert-z", action="store_true")
+
+    parser.add_argument("--x-min", type=float, default=DEFAULT_XYZ_LIMITS["x"][0])
+    parser.add_argument("--x-max", type=float, default=DEFAULT_XYZ_LIMITS["x"][1])
+    parser.add_argument("--y-min", type=float, default=DEFAULT_XYZ_LIMITS["y"][0])
+    parser.add_argument("--y-max", type=float, default=DEFAULT_XYZ_LIMITS["y"][1])
+    parser.add_argument("--z-min", type=float, default=DEFAULT_XYZ_LIMITS["z"][0])
+    parser.add_argument("--z-max", type=float, default=DEFAULT_XYZ_LIMITS["z"][1])
+
+    parser.add_argument("--use-urcap", action="store_true",
+                        help="Use External Control URCap flag if available in your ur-rtde build")
+
+    args = parser.parse_args()
+
+    if args.list_devices:
+        list_audio_devices()
+        return
+
+    xyz_limits = {
+        "x": (args.x_min, args.x_max),
+        "y": (args.y_min, args.y_max),
+        "z": (args.z_min, args.z_max),
+    }
+
+    print("=== CONFIG ===")
+    print("HOST:", args.host)
+    print("SPEED/ACC:", args.speed, args.acc)
+    print("DRY_RUN:", args.dry_run)
+    print("Audio device:", args.device)
+    print("Whisper model:", args.model)
+    print("default_step/max_step:", args.default_step, args.max_step)
+    print("require_move_verb:", args.require_move_verb)
+    print("invert x/y/z:", args.invert_x, args.invert_y, args.invert_z)
+    print("XYZ limits:", xyz_limits)
+    print("use_urcap:", args.use_urcap)
+    print("=============\n")
+
+    # 빠른 포트 체크 (연결 문제를 바로 눈치채기 위해)
+    # Dashboard(29999), RTDE(30004)
+    # (환경에 따라 ICMP는 막힐 수 있어도 포트 체크는 유효)
+    print("[NET] Checking ports ...")
+    dash_ok = tcp_connectable(args.host, 29999, timeout_s=1.5)
+    rtde_ok = tcp_connectable(args.host, 30004, timeout_s=1.5)
+    print(f"[NET] {args.host}:29999 dashboard -> {'OK' if dash_ok else 'FAIL'}")
+    print(f"[NET] {args.host}:30004 RTDE      -> {'OK' if rtde_ok else 'FAIL'}\n")
+
+    # Whisper 로드
+    print("[ASR] Loading Whisper:", args.model)
+    asr = whisper.load_model(args.model)
+
+    # RTDE 연결
+    print("[RTDE] Connecting ...")
+    try:
+        rtde_c = make_rtde_control(args.host, use_urcap=args.use_urcap)
+        rtde_r = rtde_receive.RTDEReceiveInterface(args.host)
+    except Exception as e:
+        print("\n[ERROR] RTDE connection failed:", repr(e))
+        print("체크 포인트:")
+        print("- 로봇/URSim IP(host) 맞는지")
+        print("- 로봇 Remote Control/Remote 모드 허용 여부")
+        print("- 포트 29999/30004 네트워크 차단(방화벽/포워딩) 여부")
+        raise
+
+    armed = False
+    print("\nEnter=record, q=quit")
+    print("Safety: say 'start' to arm, 'stop' to stop+disarm, 'disarm' to disarm.\n")
+    print("Command examples:")
+    print("  'start'")
+    print("  'move up 2 cm'")
+    print("  'move forward 10 millimeters'")
+    print("  'stop'\n")
+    print("NOTE: 실행 전 'yes/confirm'으로 2차 확인합니다.\n")
+
+    try:
+        while True:
+            ui = input("Command > ").strip().lower()
+            if ui == "q":
+                break
+
+            audio = record_audio(args.rec_seconds, args.sr, args.device)
+
+            print("[ASR] Transcribing...")
+            text = transcribe_once(asr, audio, language=args.lang)
+            print("[TEXT]", text if text else "(empty)")
+
+            if not text:
+                print()
+                continue
+
+            # 1) 안전 키워드 우선
+            ov = override_safety(text)
+            if ov == "START":
+                armed = True
+                print("[STATE] ARMED = True\n")
+                continue
+            if ov in ("STOP", "DISARM"):
+                print("[STATE] STOP/DISARM requested -> stopping + disarming")
+                safe_stop(rtde_c)
+                armed = False
+                print("[STATE] ARMED = False\n")
+                continue
+
+            # 2) start 전엔 이동 금지
+            if not armed:
+                print("[BLOCKED] Not armed. Say 'start' first.\n")
+                continue
+
+            # 3) 닫힌 어휘 파싱
+            parsed = parse_closed_vocab_command(
+                text,
+                default_step_m=args.default_step,
+                max_step_m=args.max_step,
+                require_move_verb=args.require_move_verb,
+                invert_x=args.invert_x,
+                invert_y=args.invert_y,
+                invert_z=args.invert_z,
+            )
+            if not parsed:
+                print("[NO_ACTION] Could not parse a safe move command.\n"
+                      "Try: 'move up 2 cm', 'move forward 10 millimeters', etc.\n")
+                continue
+
+            dx, dy, dz, found_dir, dist_m = parsed
+            print(f"[PARSE] dir={found_dir} dist={dist_m:.3f}m -> dx={dx:.3f} dy={dy:.3f} dz={dz:.3f}")
+
+            # 4) 2차 확인(음성 yes/no)
+            print("[CONFIRM] Say 'yes/confirm' to execute, or 'no/cancel' to abort (2.0s).")
+            conf = confirm_step(asr, args.sr, args.device, seconds=2.0)
+            if conf is not True:
+                print("[CANCEL] Not confirmed. No motion.\n")
+                continue
+
+            # 5) 실행
+            ok = moveL_delta(
+                rtde_c, rtde_r,
+                dx, dy, dz,
+                speed=args.speed, acc=args.acc,
+                xyz_limits=xyz_limits,
+                dry_run=args.dry_run
+            )
+            print("moveL ok:", ok, "\n")
+
+    except KeyboardInterrupt:
+        print("\n[KEYBOARD] Interrupted -> stopping + disarming")
+        safe_stop(rtde_c)
+    finally:
+        try:
+            rtde_c.stopScript()
+        except Exception:
+            pass
+        print("[RTDE] Closed")
+
+
+if __name__ == "__main__":
+    main()
