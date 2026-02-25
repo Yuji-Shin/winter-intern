@@ -1,20 +1,22 @@
 {
   "_meta": {
     "lang": "en",
-    "note": "intent -> response policy. mode: tts | beep | silent. texts can be a list (random pick). placeholders: {heard_text}, {total_moved}"
+    "version": "1.0",
+    "note": "intent -> response policy. mode: tts | beep | silent. texts can be a list (random pick). placeholders supported: {heard_text}, {total_moved}"
   },
 
   "STOP": {
     "mode": "beep",
-    "beep": [[880, 150], [880, 150]],
+    "beep": [[880, 150], [880, 150], [880, 150]],
     "texts": ["Emergency stop."]
   },
 
   "START": {
     "mode": "tts",
     "texts": [
-      "Armed. Ready.",
-      "Okay. I am ready to proceed."
+      "Armed. Ready to proceed.",
+      "Okay. I am ready.",
+      "Ready when you are."
     ]
   },
 
@@ -22,7 +24,8 @@
     "mode": "tts",
     "texts": [
       "Okay. I will slow down.",
-      "Understood. Moving slower."
+      "Understood. Moving slower.",
+      "Got it. Reducing speed now."
     ]
   },
 
@@ -30,7 +33,8 @@
     "mode": "tts",
     "texts": [
       "I am moving the tool based on your commands.",
-      "I heard: {heard_text}. I will follow your instructions."
+      "I heard: {heard_text}. I will follow your instructions.",
+      "Status: listening for commands and moving safely when armed."
     ]
   },
 
@@ -38,30 +42,17 @@
     "mode": "tts",
     "texts": [
       "I heard that you are in pain. I will stop and retract now.",
-      "Okay. Stopping and retracting for safety."
+      "Okay. Stopping and retracting for safety.",
+      "Understood. I will stop immediately and move away."
     ]
   },
 
   "OK": {
     "mode": "tts",
     "texts": [
-      "Okay. Thank you. I will continue.",
-      "Understood. Continuing."
-    ]
-  },
-
-  "RULE_MOVE": {
-    "mode": "silent",
-    "texts": [
-      "Moving now."
-    ]
-  },
-
-  "SEQUENCE": {
-    "mode": "tts",
-    "texts": [
-      "Starting sequence.",
-      "Starting the routine now."
+      "Okay. Thank you. Continuing.",
+      "Understood. I will continue.",
+      "Okay. I will proceed carefully."
     ]
   }
 }
