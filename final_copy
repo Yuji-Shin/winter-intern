@@ -658,7 +658,7 @@ def handle_intent(intent: str, rtde_c, rtde_r, state):
 
 def top3_str(candidates):
     try:
-        return " | ".join([f"{c['intent']}:{c['score']:.3f}" for c in candidates[:3]])
+        return " | ".join([f"{c['intent']}:{c['score']:.3f}" for c in candidates[:3]]) # Retrieve the top 3 intents
     except Exception:
         return ""
 
@@ -667,19 +667,19 @@ def top3_str(candidates):
 # main (REALTIME)
 # ======================
 def main():
-    metrics = None
-    listener = None
+    metrics = None # for csv file
+    listener = None # Variable to store the Whisper model for real-time speech recognition
     rtde_c = None
     rtde_r = None
 
     try:
         metrics_path = os.path.join("logs", f"metrics_{datetime.now():%Y%m%d_%H%M%S}.csv")
         metrics = MetricsCSV(metrics_path)
-        metrics.log(kind="startup", step="start", duration_ms=0, note=f"csv={metrics_path}")
+        metrics.log(kind="startup", step="start", duration_ms=0, note=f"csv={metrics_path}") # making csv file
 
         print("[ASR] Loading Whisper:", WHISPER_MODEL)
-        t0 = perf_counter()
-        asr = whisper.load_model(WHISPER_MODEL)
+        t0 = perf_counter() # Processing time measurement for CSV file
+        asr = whisper.load_model(WHISPER_MODEL) # load whisper
         metrics.log(kind="startup", step="load_whisper", duration_ms=(perf_counter() - t0) * 1000.0, note=WHISPER_MODEL)
 
         print("[NLU] Loading intent bank + MiniLM retriever/router...")
@@ -688,20 +688,20 @@ def main():
         metrics.log(kind="startup", step="load_intent_bank", duration_ms=(perf_counter() - t0) * 1000.0, note=INTENT_BANK_PATH)
 
         t0 = perf_counter()
-        retriever = MiniLMRetriever(intent_bank)
-        router = IntentRouter(retriever, threshold=THRESHOLD)
+        retriever = MiniLMRetriever(intent_bank) # load MiniLM
+        router = IntentRouter(retriever, threshold=THRESHOLD) # load router
         metrics.log(kind="startup", step="init_minilm_router", duration_ms=(perf_counter() - t0) * 1000.0, note=f"threshold={THRESHOLD}")
 
         print("[RESP] Loading intent responses:", INTENT_RESPONSES_PATH)
         t0 = perf_counter()
-        resp_cfg = load_json(INTENT_RESPONSES_PATH)
+        resp_cfg = load_json(INTENT_RESPONSES_PATH) 
         responder = IntentResponder(resp_cfg)
         metrics.log(kind="startup", step="load_intent_responses", duration_ms=(perf_counter() - t0) * 1000.0, note=INTENT_RESPONSES_PATH)
 
         print("[RTDE] Connecting to:", HOST)
         t0 = perf_counter()
         rtde_c = rtde_control.RTDEControlInterface(HOST)
-        rtde_r = rtde_receive.RTDEReceiveInterface(HOST)
+        rtde_r = rtde_receive.RTDEReceiveInterface(HOST) # connecting to robot system
         metrics.log(kind="startup", step="connect_rtde", duration_ms=(perf_counter() - t0) * 1000.0, note=HOST)
 
         state = {"armed": False, "speed_scale": 1.0, "total_moved": 0.0}
@@ -713,9 +713,9 @@ def main():
               "- Try: 'move up 5 cm', 'move forward 10 centimeters'\n")
 
         listener = RealtimeWhisper(asr, sample_rate=SAMPLE_RATE, input_device=INPUT_DEVICE)
-        listener.start()
+        listener.start() # start real time listening
 
-        utt_id = 0
+        utt_id = 0 # Variable to assign an index to each user utterance
 
         for text in listener.listen_texts():
             utt_id += 1
@@ -726,7 +726,9 @@ def main():
                 metrics.log(kind="utterance", step="empty_text", utt_id=utt_id, duration_ms=0, asr_ms=asr_ms, text="")
                 continue
 
-            # 1) 안전 키워드 override 최우선(초저지연)
+# Command execution priority:
+# Safety keyword override → Rule-based move parsing (if available) → MiniLM intent routing
+            # 1) Safety keyword override has the highest priority (ultra-low latency)
             t0 = perf_counter()
             ov = override_safety(text)
             ov_ms = (perf_counter() - t0) * 1000.0
