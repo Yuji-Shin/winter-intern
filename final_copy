@@ -99,7 +99,7 @@ DIR_WORDS = {
     "forward":  ("x", +1),
     "back":     ("x", -1),
     "backward": ("x", -1),
-}
+} #for parse_move_command function
 MOVE_VERBS = ["move", "go", "shift", "translate", "slide"]
 
 
@@ -494,10 +494,10 @@ class IntentResponder:
 # ======================
 def load_intent_bank(path: str):
     return load_json(path)
-
+#just for record
 
 def override_safety(text: str):
-    t = text.lower()
+    t = text.lower() # change all input to small letter : input normalization to standardized output
     if any(k in t for k in PAIN_KEYWORDS):
         return "PAIN"
     if any(k in t for k in STOP_KEYWORDS):
@@ -505,10 +505,10 @@ def override_safety(text: str):
     if any(k in t for k in START_KEYWORDS):
         return "START"
     return None
-
+# determines whether to activate the override system (pain, stop, start) 
 
 def extract_distance_m(text: str, default_m: float = 0.05) -> float:
-    t = text.lower()
+    t = text.lower() # input normalization to standardized output
     m = re.search(r"(\d+(\.\d+)?)\s*(mm|millimeter|millimeters)", t)
     if m:
         return max(0.0, float(m.group(1)) / 1000.0)
@@ -519,16 +519,16 @@ def extract_distance_m(text: str, default_m: float = 0.05) -> float:
     if m:
         return max(0.0, float(m.group(1)))
     return default_m
-
+# identifie distance-related text and standardizes the units into meters to enable rule-based command interpretation that related to prase_move_command function
 
 def parse_move_command(text: str):
     """
-    "move up 5 cm" 같은 규칙 기반 이동 명령 파싱.
-    성공하면 (dx,dy,dz) 반환, 아니면 None.
+   Parses rule-based movement commands such as 'move up 5 cm'.
+   Returns (dx, dy, dz) if successful; otherwise, returns None.
     """
-    t = text.lower()
+    t = text.lower()  # input normalization to standardized output
 
-    found_dir = None
+    found_dir = None # stores the specific direction keyword from user input, initialzation first
     for w in DIR_WORDS.keys():
         if re.search(rf"\b{re.escape(w)}\b", t):
             found_dir = w
@@ -543,13 +543,14 @@ def parse_move_command(text: str):
     axis, sign = DIR_WORDS[found_dir]
     dist_m = extract_distance_m(t, default_m=0.05)
 
-    dx = dy = dz = 0.0
+    dx = dy = dz = 0.0 # stores the distance the robot needs to move
     if axis == "x":
         dx = sign * dist_m
     elif axis == "y":
         dy = sign * dist_m
     else:
         dz = sign * dist_m
+    # Converting commands into robot-understandable vectors
 
     return dx, dy, dz
 
@@ -559,31 +560,32 @@ def clamp_pose_xyz(pose):
     pose[1] = float(np.clip(pose[1], XYZ_LIMITS["y"][0], XYZ_LIMITS["y"][1]))
     pose[2] = float(np.clip(pose[2], XYZ_LIMITS["z"][0], XYZ_LIMITS["z"][1]))
     return pose
-
+# constrain coordinates to stay within the XYZ limits
 
 def safe_stop(rtde_c):
     try:
-        rtde_c.stopL(2.0)
+        rtde_c.stopL(2.0) #liner stop, more complex process
         return True
     except Exception:
         try:
-            rtde_c.stopJ(2.0)
+            rtde_c.stopJ(2.0) # joint stop
             return True
         except Exception:
             return False
+# Fail-safe mechanism for emergency stopping
 
 
 def moveL_delta(rtde_c, rtde_r, dx, dy, dz, speed, acc):
-    pose = rtde_r.getActualTCPPose()
+    pose = rtde_r.getActualTCPPose() # read robot current location
     print("current TCP pose:", pose)
 
     target = pose.copy()
     target[0] += float(dx)
     target[1] += float(dy)
     target[2] += float(dz)
-    target = clamp_pose_xyz(target)
+    target = clamp_pose_xyz(target) # prevent the robot from exceeding a specified limit within the function
 
-    # 실제 이동거리(클램프 반영)
+    # real robot moved-distance (reflected clamp)
     adx = float(target[0] - pose[0])
     ady = float(target[1] - pose[1])
     adz = float(target[2] - pose[2])
@@ -595,61 +597,63 @@ def moveL_delta(rtde_c, rtde_r, dx, dy, dz, speed, acc):
         print("[DRY_RUN] skip moveL")
         return True, moved_dist
 
-    ok = rtde_c.moveL(target, speed, acc)
+    ok = rtde_c.moveL(target, speed, acc) # if moving was successed: True, moving was failed: False
     return ok, moved_dist
 
 
 def handle_intent(intent: str, rtde_c, rtde_r, state):
     """
-    intent -> 로봇 동작/상태 변경
+    intent -> changing robot moving output/state
     state: dict (armed, speed_scale, total_moved)
     """
-    intent = (intent or "").upper()
+    intent = (intent or "").upper() # convert input to capital letters : normalization
     moved = 0.0
-    ok = True
+    ok = True # default vaule, it can be changed in moveL_delta function 
 
     if intent == "STOP":
         print("[INTENT] STOP -> stopping + disarming")
         safe_stop(rtde_c)
-        state["armed"] = False
+        state["armed"] = False  # system unarmed
         return {"ok": True, "moved": 0.0}
+        # override keyword
 
     if intent == "START":
-        state["armed"] = True
+        state["armed"] = True # system armed
         print("[INTENT] START -> ARMED=True")
         return {"ok": True, "moved": 0.0}
 
     if intent == "PAIN":
         print("[INTENT] PAIN -> stop + retract(up) + disarm")
         safe_stop(rtde_c)
-        time.sleep(0.1)
+        time.sleep(0.1) # Wait for the robot to come to a full stop
         retract_speed = BASE_SPEED * 0.5
-        retract_acc = BASE_ACC * 0.5
-        ok, moved = moveL_delta(rtde_c, rtde_r, 0.0, 0.0, +PAIN_RETRACT_Z_M, retract_speed, retract_acc)
-        print("retract ok:", ok)
-        state["armed"] = False
+        retract_acc = BASE_ACC * 0.5 # Cut to half the existing speed and set it to move away safely
+        ok, moved = moveL_delta(rtde_c, rtde_r, 0.0, 0.0, +PAIN_RETRACT_Z_M, retract_speed, retract_acc) # No changes in x and y axes, only changes in z-axis exist
+        print("retract ok:", ok) # The variable ok stores whether the robot moved properly (true: success, false: failure)
+        state["armed"] = False # system unarmed
         return {"ok": ok, "moved": moved}
+        # override keyword
 
     if intent == "MOVE_SLOW":
         state["speed_scale"] = 0.5
         print("[INTENT] MOVE_SLOW -> speed_scale=0.5")
         return {"ok": True, "moved": 0.0}
+        #speed scale covert to 0.5
 
     if intent == "OK":
         state["speed_scale"] = 1.0
         print("[INTENT] OK -> speed_scale=1.0")
         return {"ok": True, "moved": 0.0}
+        # speed scale maintain 
 
     if intent == "EXPLAIN":
         print("[INTENT] EXPLAIN")
         return {"ok": True, "moved": 0.0}
-
-    if intent == "SEQUENCE":
-        print("[INTENT] SEQUENCE (placeholder)")
-        return {"ok": True, "moved": 0.0}
+        # There is no movement change.
 
     print("[INTENT] Unknown/Unhandled:", intent)
     return {"ok": False, "moved": 0.0}
+    # This is the case that MiniLM didn't catch any intent.
 
 
 def top3_str(candidates):
