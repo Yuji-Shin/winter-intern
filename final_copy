@@ -41,6 +41,7 @@ from src.router import IntentRouter
 # ======================
 SAMPLE_RATE = 16000         # Audio sample rate [Hz] (= samples per second).
 INPUT_DEVICE = 1            # sounddevice input device index (int). Use None for default device.
+# command to list the sounddevice/PortAudio device indices: python -c "import sounddevice as sd; print(sd.query_devices())"
 WHISPER_MODEL = "base.en"   # Whisper model name (English-only base).
 
 # Realtime chunk / (simple) VAD-ish settings
