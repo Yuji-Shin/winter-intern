@@ -760,7 +760,7 @@ def main():
                 print("[STATE]", state, "\n")
                 continue
 
-            # 2) 규칙 기반 move 파싱이 되면 그걸 먼저 실행
+            # 2) If rule-based move parsing succeeds, execute it.
             t0 = perf_counter()
             delta = parse_move_command(text)
             parse_ms = (perf_counter() - t0) * 1000.0
@@ -806,7 +806,7 @@ def main():
                 print("moveL ok:", ok, "\n")
                 continue
 
-            # 3) MiniLM intent 라우팅
+            # 3) MiniLM intent routing
             t0 = perf_counter()
             chosen, candidates = router.route(text)
             route_ms = (perf_counter() - t0) * 1000.0
@@ -835,7 +835,7 @@ def main():
 
             print("\n[CHOSEN]", chosen)
 
-            # PAIN/STOP/START 같은 안전 intent는 armed 여부와 관계 없이 처리
+            # Safety intents such as PAIN, STOP, and START are processed regardless of the armed state.
             if intent in ["PAIN", "STOP", "START"]:
                 t1 = perf_counter()
                 res = handle_intent(intent, rtde_c, rtde_r, state)
@@ -860,7 +860,7 @@ def main():
                 print("[STATE]", state, "\n")
                 continue
 
-            # 나머지는 start(armed) 이후에만 실행
+            # The remaining intents are processed only after the system is armed via START.
             if not state["armed"]:
                 metrics.log(
                     kind="utterance",
@@ -899,11 +899,11 @@ def main():
 
             print("[STATE]", state, "\n")
 
-    except KeyboardInterrupt:
+    except KeyboardInterrupt: # Forced shutdown by the user(Ctrl+C)
         print("\n[QUIT] Ctrl+C")
         if metrics:
             metrics.log(kind="startup", step="keyboard_interrupt", duration_ms=0)
-    except Exception as e:
+    except Exception as e: # Other shutdown case
         print("\n[ERROR]", repr(e))
         if metrics:
             metrics.log(kind="startup", step="exception", duration_ms=0, note=repr(e))
