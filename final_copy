@@ -735,8 +735,8 @@ def main():
 # Safety keyword override → Rule-based move parsing (if available) → MiniLM intent routing
             # 1) Safety keyword override has the highest priority (ultra-low latency)
             t0 = perf_counter()
-            ov = override_safety(text)
-            ov_ms = (perf_counter() - t0) * 1000.0
+            ov = override_safety(text) # check for emergency safety keywords
+            ov_ms = (perf_counter() - t0) * 1000.0 # typically under 1 ms, convert unit (m to ms)
 
             if ov:
                 t1 = perf_counter()
@@ -755,14 +755,14 @@ def main():
                     text=text,
                     override_intent=ov,
                     chosen_intent=ov,
-                    note=f"action_ms={act_ms:.3f}, armed={state['armed']}, speed_scale={state['speed_scale']}, resp_mode={r.get('mode')}"
+                    note=f"action_ms={act_ms:.3f}, armed={state['armed']}, speed_scale={state['speed_scale']}, resp_mode={r.get('mode')}" # action_ms: time required for the robot to physically move or stop(in ms)
                 )
                 print("[STATE]", state, "\n")
                 continue
 
             # 2) If rule-based move parsing succeeds, execute it.
             t0 = perf_counter()
-            delta = parse_move_command(text)
+            delta = parse_move_command(text) # extract "direction" and  "distance" from the user's speech. Return [dx, dy, dz] 
             parse_ms = (perf_counter() - t0) * 1000.0
 
             if delta:
@@ -781,8 +781,8 @@ def main():
                     continue
 
                 dx, dy, dz = delta
-                speed = BASE_SPEED * state["speed_scale"]
-                acc = BASE_ACC * state["speed_scale"]
+                speed = BASE_SPEED * state["speed_scale"] # state["speed_scale"]: current robot speed ratio
+                acc = BASE_ACC * state["speed_scale"] 
                 print(f"[RULE_MOVE] dx={dx:.3f}, dy={dy:.3f}, dz={dz:.3f}  speed={speed:.3f}")
 
                 t1 = perf_counter()
