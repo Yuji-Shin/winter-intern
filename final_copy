@@ -201,88 +201,88 @@ class RealtimeWhisper:
         self._stream.start()             # Start capturing mic input.
 
     def stop(self):
-        self.stop_event.set()
+        self.stop_event.set()            # Set stop flag.
         with self._io_lock:
             if self._stream:
                 try:
-                    self._stream.stop()
+                    self._stream.stop()  # Stop the stream.
                 except Exception:
                     pass
                 try:
-                    self._stream.close()
+                    self._stream.close() # Release audio resources.
                 except Exception:
                     pass
-                self._stream = None
+                self._stream = None      # Remove handle.
 
     def set_muted(self, muted: bool):
         if muted:
-            self._muted.set()
-            self.clear_queue()
+            self._muted.set()            # Enable mute.
+            self.clear_queue()           # Drop any buffered audio (avoid self-voice leakage).
         else:
-            self._muted.clear()
-            self.clear_queue()
+            self._muted.clear()          # Disable mute.
+            self.clear_queue()           # Also clear queue on resume.
 
     def clear_queue(self):
         try:
             while True:
-                self.q.get_nowait()
+                self.q.get_nowait()      # Drain the queue.
         except queue.Empty:
             pass
 
-    # ✅ 가장 확실한 방식: 출력 중에는 입력 스트림 자체를 stop/start
+  
     def pause_input_stream(self):
         with self._io_lock:
-            self.set_muted(True)
+            self.set_muted(True)         # Soft mute + queue clear.
             if self._stream:
                 try:
-                    self._stream.stop()
+                    self._stream.stop()  # Hard stop the input stream (most reliable).
                 except Exception:
                     pass
-            self.clear_queue()
+            self.clear_queue()           # Drain leftover chunks.
 
     def resume_input_stream(self):
         with self._io_lock:
             if self._stream and not self.stop_event.is_set():
                 try:
-                    self._stream.start()
+                    self._stream.start()  # Restart input stream.
                 except Exception as e:
                     print("[AUDIO] resume failed:", repr(e))
-            self.clear_queue()
-            self.set_muted(False)
+            self.clear_queue()            # Clear post-restart residues.
+            self.set_muted(False)         # Unmute.
 
     def listen_texts(self):
-        in_speech = False
-        utt = np.zeros((0,), dtype=np.float32)
-        silence = 0
+        in_speech = False                        # Are we currently inside an utterance?
+        utt = np.zeros((0,), dtype=np.float32)   # Buffer for the current utterance audio.
+        silence = 0                              # Accumulated silence (frames).
 
         while not self.stop_event.is_set():
             try:
-                chunk = self.q.get(timeout=0.2)
+                chunk = self.q.get(timeout=0.2)  # Wait up to 0.2 s for audio.
             except queue.Empty:
                 continue
 
-            rms = float(np.sqrt(np.mean(chunk * chunk) + 1e-12))
+            rms = float(np.sqrt(np.mean(chunk * chunk) + 1e-12)) # Compute RMS energy (unitless). 1e-12 avoids numerical issues.
             if DEBUG_ENERGY:
-                print(f"[RMS] {rms:.5f}")
+                print(f"[RMS] {rms:.5f}")                        # Print RMS for tuning.
 
-            is_speech = rms > ENERGY_THRESHOLD
+            is_speech = rms > ENERGY_THRESHOLD                   # Speech if RMS exceeds threshold.
 
             if is_speech:
-                in_speech = True
-                silence = 0
-                utt = np.concatenate([utt, chunk])
+                in_speech = True                           # Mark as in-speech.
+                silence = 0                                # Reset silence counter.
+                utt = np.concatenate([utt, chunk])         # Append audio.
 
-                if len(utt) > self.max_utt_frames:
-                    text = self._transcribe_utt(utt)
+                if len(utt) > self.max_utt_frames:         # Force-cut if utterance too long.
+                    text = self._transcribe_utt(utt)       # Whisper transcription.
                     if text:
-                        yield text
+                        yield text                         # Yield recognized text.
                     utt = np.zeros((0,), dtype=np.float32)
                     in_speech = False
                     silence = 0
             else:
                 if in_speech:
-                    silence += len(chunk)
-                    utt = np.concatenate([utt, chunk])
+                    silence += len(chunk)                   # Add silent frames.
+                    utt = np.concatenate([utt, chunk])      # Keep a little tail silence for natural endings.
                     if silence >= self.end_silence_frames:
                         if len(utt) >= self.min_speech_frames:
                             text = self._transcribe_utt(utt)
@@ -293,19 +293,19 @@ class RealtimeWhisper:
                         silence = 0
 
     def _transcribe_utt(self, audio_1d: np.ndarray) -> str:
-        t0 = perf_counter()
+        t0 = perf_counter()               # Start timer (seconds).
         result = self.asr.transcribe(
-            audio_1d,
-            language="en",
-            fp16=False,
-            beam_size=1,
-            best_of=1,
-            temperature=0.0,
-            condition_on_previous_text=False,
-            verbose=False,
+            audio_1d,                     # 1D float32 audio array (samples).
+            language="en",                # Force English.
+            fp16=False,                   # Disable fp16 (often more stable on CPU).
+            beam_size=1,                  # Beam search width (1 = fast).
+            best_of=1,                    # Number of candidates (1 = fast).
+            temperature=0.0,              # 0 => deterministic.
+            condition_on_previous_text=False, # Don't condition on previous utterances (avoid drift).
+            verbose=False,                # Reduce console output.
         )
-        self.last_asr_ms = (perf_counter() - t0) * 1000.0
-        return (result.get("text") or "").strip()
+        self.last_asr_ms = (perf_counter() - t0) * 1000.0 # Store ASR time in milliseconds.
+        return (result.get("text") or "").strip()         # Return recognized text (trimmed).
 
 
 # ======================
@@ -313,50 +313,51 @@ class RealtimeWhisper:
 # ======================
 def load_json(path: str):
     with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
+        return json.load(f) # Load JSON into Python dict/list.
 
 
 def _format_template(s: str, heard_text: str, total_moved: float) -> str:
     try:
         return s.format(heard_text=heard_text, total_moved=total_moved)
+# Fill template placeholders like {heard_text}, {total_moved}.
     except Exception:
-        return s
+        return s        # If formatting fails, return original string.
 
 
 def _play_beep_sequence(seq, sr=BEEP_SR, volume=BEEP_VOLUME):
     """
-    seq: [[freq, ms], ...]
+    seq: [[freq, ms], ...] # freq [Hz], duration [ms]
     """
     out = []
     for item in (seq or []):
         try:
-            freq, ms = float(item[0]), float(item[1])
+            freq, ms = float(item[0]), float(item[1]) # Parse frequency [Hz] and duration [ms].
         except Exception:
             continue
-        n = int(sr * (ms / 1000.0))
-        t = np.arange(n, dtype=np.float32) / sr
-        tone = (np.sin(2.0 * np.pi * freq * t) * volume).astype(np.float32)
+        n = int(sr * (ms / 1000.0))                # Samples = sr [samples/s] * duration [s].
+        t = np.arange(n, dtype=np.float32) / sr    # Time axis [s].
+        tone = (np.sin(2.0 * np.pi * freq * t) * volume).astype(np.float32) # Generate sine wave beep (amplitude scaled by volume).
         out.append(tone)
-        out.append(np.zeros(int(sr * 0.02), dtype=np.float32))  # small gap
+        out.append(np.zeros(int(sr * 0.02), dtype=np.float32))  # Add a 20 ms silence gap between tones.
 
     if not out:
         return
 
-    y = np.concatenate(out)
-    sd.play(y, sr, blocking=True)
+    y = np.concatenate(out)        # Concatenate all tones + gaps.
+    sd.play(y, sr, blocking=True)  # Play audio, blocking until finished.
 
 
 class TTSEngine:
     """
-    ✅ 가장 안정적인 TTS 우선순위:
-      1) OS TTS 명령(espeak/spd-say/say/PowerShell SAPI)
-      2) pyttsx3를 매번 init -> runAndWait -> stop (재사용 금지)
-      3) 최후: print
+      Most stable TTS priority:
+      1) OS TTS commands (espeak/spd-say/say/PowerShell SAPI)
+      2) pyttsx3: init -> runAndWait -> stop every call (do NOT reuse)
+      3) last resort: print
     """
     def __init__(self):
-        self.system = platform.system().lower()
-        self.backend = self._detect_backend()
-        print(f"[TTS] backend={self.backend}")
+        self.system = platform.system().lower()  # OS name in lowercase.
+        self.backend = self._detect_backend()    # Choose available TTS backend.
+        print(f"[TTS] backend={self.backend}")   # Show chosen backend.
 
     def _detect_backend(self) -> str:
         # Linux: espeak -> spd-say
@@ -377,7 +378,7 @@ class TTSEngine:
         # Windows
         if "windows" in self.system:
             # PowerShell is usually available
-            return "powershell"
+            return "powershell"     # Use PowerShell to invoke Windows SAPI.
 
         return "pyttsx3"
 
@@ -402,7 +403,7 @@ class TTSEngine:
 
             if self.backend == "powershell":
                 # Windows SAPI via PowerShell (quote-safe)
-                safe = text.replace("'", "''")
+                safe = text.replace("'", "''")  # Escape single quotes for PowerShell.
                 ps = (
                     "Add-Type -AssemblyName System.Speech; "
                     "$speak = New-Object System.Speech.Synthesis.SpeechSynthesizer; "
@@ -411,11 +412,10 @@ class TTSEngine:
                 subprocess.run(["powershell", "-NoProfile", "-Command", ps], check=False)
                 return
 
-            # pyttsx3 fallback (매번 init 하는게 핵심)
             if self.backend == "pyttsx3":
                 try:
                     import pyttsx3  # type: ignore
-                    engine = pyttsx3.init()
+                    engine = pyttsx3.init()   # Key idea: create a fresh engine every time.
                     engine.say(text)
                     engine.runAndWait()
                     engine.stop()
@@ -438,51 +438,49 @@ class IntentResponder:
       - beep: [[freq, ms], ...]
     """
     def __init__(self, cfg: dict):
-        self.cfg = cfg or {}
-        self.meta = self.cfg.get("_meta", {})
-        self.tts = TTSEngine()
+        self.cfg = cfg or {}                    # Store config (fallback to empty dict).
+        self.meta = self.cfg.get("_meta", {})   # Optional meta info.
+        self.tts = TTSEngine()                  # Initialize TTS engine.
 
     def _pick(self, intent: str, heard_text: str, total_moved: float) -> Tuple[Optional[str], Optional[str], dict]:
-        item = self.cfg.get(intent, None)
+        item = self.cfg.get(intent, None)       # Policy entry for the given intent.
         if not item:
-            return None, None, {}
+            return None, None, {}               # No policy => no response.
 
-        mode = (item.get("mode") or "silent").lower()
-        texts = item.get("texts", None)
+        mode = (item.get("mode") or "silent").lower() # Default mode is silent.
+        texts = item.get("texts", None)               # Response text(s).
 
         text = None
         if isinstance(texts, list) and texts:
-            text = random.choice(texts)
+            text = random.choice(texts)              # Randomly pick one.
         elif isinstance(texts, str):
-            text = texts
+            text = texts                             # Single string.
 
         if isinstance(text, str):
             text = _format_template(text, heard_text=heard_text, total_moved=total_moved)
-
-        return mode, text, item
+                                         # Apply template formatting.
+        return mode, text, item          # Return mode, selected text, and raw policy item.
 
     def respond(self, intent: str, heard_text: str, state: dict, listener: Optional[RealtimeWhisper]):
-        intent = (intent or "").upper()
-        total_moved = float(state.get("total_moved", 0.0) or 0.0)
+        intent = (intent or "").upper()                           # Normalize intent key to uppercase.
+        total_moved = float(state.get("total_moved", 0.0) or 0.0) # Pull total moved distance from state (typically [m]).
 
         mode, text, item = self._pick(intent, heard_text, total_moved)
         if not mode:
             return {"mode": None, "text": None}
 
-        # ✅ 출력 중 입력 스트림 완전히 stop/start
+        # Hard stop/start mic input while producing audio output (beep/TTS).
         if listener is not None and mode in ("tts", "beep"):
-            listener.pause_input_stream()
+            listener.pause_input_stream() # Stop mic input to prevent feedback/crosstalk.
             try:
                 if mode == "beep":
                     _play_beep_sequence(item.get("beep"))
                 elif mode == "tts":
                     if text:
                         self.tts.speak(text)
-                # silent면 아무것도 안 함
             finally:
-                # 아주 짧은 딜레이로 장치 안정화(환경에 따라 도움됨)
-                time.sleep(0.03)
-                listener.resume_input_stream()
+                time.sleep(0.03)                # Small stabilization delay [s] (= 30 ms).
+                listener.resume_input_stream()  # Restart mic input.
         else:
             if mode == "beep":
                 _play_beep_sequence(item.get("beep"))
@@ -490,7 +488,7 @@ class IntentResponder:
                 if text:
                     self.tts.speak(text)
 
-        return {"mode": mode, "text": text}
+        return {"mode": mode, "text": text}     # Return what was actually done (useful for logging/debug).
 유지
 ---------------------------------------------------------------------------------------------------------------
 제희
