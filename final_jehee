@@ -188,21 +188,23 @@ If asr_busy_event is set:
 
         self.q.put(indata[:, 0].copy())  # Push mono channel (copy) into queue.
 
-    def start(self):
-        self.stop_event.clear()
-        self._stream = sd.InputStream(
-            samplerate=self.sr,
-            channels=1,
-            dtype="float32",
-            blocksize=self.chunk_frames,
-            device=self.device,
-            callback=self._audio_cb,
-        )
+    def start(self): # start audio recording
+        self.stop_event.clear() # Reset the stop signal 
+        # Delete the remaining stop signal since a new recording is starting.
+        # Initialize a stream to receive microphone input
+        self._stream = sd.InputStream( 
+            samplerate=self.sr, # Audio sampling rate (number of samples per second)
+            channels=1, # Mono recording (no left–right channel separation)
+            dtype="float32", # data type (The most commonly used format for deep learning models)
+            blocksize=self.chunk_frames, # Audio buffer size (larger size → slower processing speed)
+            device=self.device, # Device number selection for cases where multiple microphones are connected
+            callback=self._audio_cb, # Callback function executed whenever the blocksize is filled
+        ) 
         self._stream.start()
 
-    def stop(self):
-        self.stop_event.set()
-        if self._stream:
+    def stop(self): # stop audio recording
+        self.stop_event.set() # stop signal
+        if self._stream: # check if the stream is on
             try:
                 self._stream.stop()
             except Exception:
@@ -213,23 +215,25 @@ If asr_busy_event is set:
                 pass
             self._stream = None
 
-    def _drain_queue(self):
+    def _drain_queue(self): # Clearing remaining audio data in the queue
         try:
             while True:
                 self.q.get_nowait()
         except queue.Empty:
             pass
 
-    def clear_buffers(self):
-        self._drain_queue()
+    def clear_buffers(self): 
+        self._drain_queue() 
+# Although the buffer and the queue are technically different, 
+# clearing the queue effectively has the same effect as clearing the buffer.
 
     def listen_texts(self):
-        in_speech = False
-        utt = np.zeros((0,), dtype=np.float32)
-        silence = 0
+        in_speech = False # Determining whether a person is currently speaking
+        utt = np.zeros((0,), dtype=np.float32) # Variable for storing speech data
+        silence = 0 # Silence duration counter
 
         while not self.stop_event.is_set():
-            # mute 중이면 버퍼/큐 리셋하고 기다림
+            # Reset buffer/queue and wait if muted
             if self.mute_event is not None and self.mute_event.is_set():
                 in_speech = False
                 utt = np.zeros((0,), dtype=np.float32)
@@ -238,16 +242,18 @@ If asr_busy_event is set:
                 time.sleep(0.02)
                 continue
 
+            # Retrieving an audio chunk from the queue
             try:
                 chunk = self.q.get(timeout=0.2)
             except queue.Empty:
                 continue
 
+            # Calculating voice energy
             rms = float(np.sqrt(np.mean(chunk * chunk) + 1e-12))
             if self.debug_energy:
                 print(f"[RMS] {rms:.5f}")
 
-            is_speech = rms > self.energy_threshold
+            is_speech = rms > self.energy_threshold # Considered as speaking when the energy exceeds the threshold
 
             if is_speech:
                 in_speech = True
@@ -263,14 +269,14 @@ If asr_busy_event is set:
 
                     if text:
                         yield text
-                        self.clear_buffers()   # 발화 처리 후 큐 비우기
-            else:
-                if in_speech:
+                        self.clear_buffers()   # clearing queue after utterance processing
+            else: # in silence case
+                if in_speech: # in case speaking just before
                     silence += len(chunk)
                     utt = np.concatenate([utt, chunk])
-                    if silence >= self.end_silence_frames:
+                    if silence >= self.end_silence_frames: # Consider the utterance finished when the silence duration exceeds a certain threshold
                         if len(utt) >= self.min_speech_frames:
-                            text = self._transcribe_utt(utt)
+                            text = self._transcribe_utt(utt) # AI Whisper translation
 
                             utt = np.zeros((0,), dtype=np.float32)
                             in_speech = False
@@ -278,15 +284,15 @@ If asr_busy_event is set:
 
                             if text:
                                 yield text
-                                self.clear_buffers()   # 발화 처리 후 큐 비우기
+                                self.clear_buffers()   # clearing queue after utterance processing
                         else:
-                            utt = np.zeros((0,), dtype=np.float32)
+                            utt = np.zeros((0,), dtype=np.float32) # Skip translation if the audio is too short
                             in_speech = False
                             silence = 0
 
-    def _transcribe_utt(self, audio_1d: np.ndarray) -> str:
-        self.asr_busy_event.set()
-        self._drain_queue()   # transcribe 직전 stale audio 제거
+    def _transcribe_utt(self, audio_1d: np.ndarray) -> str: # Call Whisper
+        self.asr_busy_event.set() # Notification that Whisper is translating
+        self._drain_queue()   # Removing stale audio before transcription
 
         try:
             t0 = perf_counter()
@@ -296,14 +302,14 @@ If asr_busy_event is set:
                 fp16=False,
                 beam_size=1,
                 best_of=1,
-                temperature=0.0,
+                temperature=0.0, # Only transcribe audible audio
                 condition_on_previous_text=False,
                 verbose=False,
-            )
+            ) # Tuned for minimal latency rather than accuracy
             self.last_asr_ms = (perf_counter() - t0) * 1000.0
             return (result.get("text") or "").strip()
         finally:
-            self._drain_queue()   # transcribe 동안 들어온 audio 제거
+            self._drain_queue()   # Removing audio received during transcription
             self.asr_busy_event.clear()
 
 
@@ -341,27 +347,24 @@ def has_keyword(text: str, keywords) -> bool:
 
 
 def override_safety(text: str) -> Optional[str]:
-    t = text.lower()
-
-    # 초저지연 PAIN
+    t = text.lower() # change all input to small letter : input normalization to standardized output
     if has_keyword(t, PAIN_KEYWORDS):
         return "PAIN"
-
     if has_keyword(t, STOP_KEYWORDS):
         return "STOP"
     if has_keyword(t, DISARM_KEYWORDS):
         return "DISARM"
     if has_keyword(t, START_KEYWORDS):
         return "START"
-
+    # determines whether to activate the override system (pain, stop, start) 
     return None
 
 
 def extract_distance_m_clamped(text: str, default_m: float, max_step_m: float) -> float:
     """
-    거리 추출(mm/cm/m) + 0~max_step_m clamp
+    distance extraction(mm/cm/m) + 0~max_step_m clamp
     """
-    t = text.lower()
+    t = text.lower() # input normalization to standardized output
 
     m = re.search(r"(\d+(\.\d+)?)\s*(mm|millimeter|millimeters)\b", t)
     if m:
@@ -379,6 +382,7 @@ def extract_distance_m_clamped(text: str, default_m: float, max_step_m: float) -
         return float(np.clip(val, 0.0, max_step_m))
 
     return float(np.clip(default_m, 0.0, max_step_m))
+    # identifie distance-related text and standardizes the units into meters to enable rule-based command interpretation that related to prase_move_command function
 
 
 def parse_move_command(
@@ -388,12 +392,12 @@ def parse_move_command(
     require_move_verb: bool = True,
 ) -> Optional[Tuple[float, float, float, str, float]]:
     """
-    "move up 5 cm" 같은 규칙 기반 이동 명령 파싱.
-    성공하면 (dx,dy,dz, found_dir, dist_m) 반환, 아니면 None.
+    Parses rule-based movement commands such as 'move up 5 cm'.
+    Returns (dx, dy, dz, found_dir, dist_m) if successful; otherwise, returns None.
     """
     t = text.lower()
 
-    found_dir = None
+    found_dir = None # stores the specific direction keyword from user input, initialzation first
     for w in DIR_WORDS.keys():
         if re.search(rf"\b{re.escape(w)}\b", t):
             found_dir = w
@@ -409,14 +413,14 @@ def parse_move_command(
     axis, sign = DIR_WORDS[found_dir]
     dist_m = extract_distance_m_clamped(t, default_m=default_step_m, max_step_m=max_step_m)
 
-    dx = dy = dz = 0.0
+    dx = dy = dz = 0.0 # stores the distance the robot needs to move
     if axis == "x":
         dx = sign * dist_m
     elif axis == "y":
         dy = sign * dist_m
     else:
         dz = sign * dist_m
-
+    # Converting commands into robot-understandable vectors
     return dx, dy, dz, found_dir, dist_m
 
 
@@ -425,29 +429,29 @@ def clamp_pose_xyz(pose, xyz_limits):
     pose[1] = float(np.clip(pose[1], xyz_limits["y"][0], xyz_limits["y"][1]))
     pose[2] = float(np.clip(pose[2], xyz_limits["z"][0], xyz_limits["z"][1]))
     return pose
-
+    # constrain coordinates to stay within the XYZ limits
 
 def safe_stop(rtde_c) -> bool:
     try:
-        rtde_c.stopL(2.0)
+        rtde_c.stopL(2.0) # liner stop, more complex process
         return True
     except Exception:
         try:
-            rtde_c.stopJ(2.0)
+            rtde_c.stopJ(2.0)  # joint stop
             return True
         except Exception:
             return False
-
+# Fail-safe mechanism for emergency stopping
 
 def moveL_delta(rtde_c, rtde_r, dx, dy, dz, speed, acc, xyz_limits, dry_run: bool):
-    pose = rtde_r.getActualTCPPose()
+    pose = rtde_r.getActualTCPPose()  # read robot current location
     print("current TCP pose:", pose)
 
     target = pose.copy()
     target[0] += float(dx)
     target[1] += float(dy)
     target[2] += float(dz)
-    target = clamp_pose_xyz(target, xyz_limits)
+    target = clamp_pose_xyz(target, xyz_limits) # prevent the robot from exceeding a specified limit within the function
 
     print("target  TCP pose:", target)
 
