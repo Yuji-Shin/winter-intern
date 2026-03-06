@@ -1,0 +1,518 @@
+# ======================
+# main
+# ======================
+def main(): # Main entry point of the program.
+    parser = argparse.ArgumentParser() # Create a command-line argument parser.
+    parser.add_argument("--host", default="192.168.10.11", help="Robot/URSim controller IP") # IP address of the UR robot or URSim controller.
+    parser.add_argument("--use-urcap", action="store_true", help="Use External Control URCap flag if available") # Whether to use the External Control URCap flag.
+    parser.add_argument("--dry-run", action="store_true", help="Do not execute moveL, only print target pose") # If enabled, motion targets are printed but not executed.
+
+    parser.add_argument("--list-devices", action="store_true", help="List audio input devices and exit") # If enabled, print microphone device list and exit.
+    parser.add_argument("--device", type=int, default=None, help="sounddevice input device index (None=default)") # Audio input device index. None means system default.
+
+    parser.add_argument("--sr", type=int, default=16000, help="Sample rate") # Audio sample rate in Hz.
+    parser.add_argument("--model", default="base.en", help="Whisper model (tiny.en/base.en/...)") # Whisper model name.
+    parser.add_argument("--lang", default="en", help="Whisper language") # Language passed to Whisper.
+
+    parser.add_argument("--chunk-ms", type=int, default=30, help="20~50ms recommended") # Audio callback chunk size in milliseconds.
+    parser.add_argument("--energy", type=float, default=0.012, help="RMS threshold") # Energy threshold used for simple voice activity detection.
+    parser.add_argument("--min-speech", type=float, default=0.25) # Minimum utterance duration in seconds.
+    parser.add_argument("--end-silence", type=float, default=0.55) # Silence duration required to end an utterance.
+    parser.add_argument("--max-utt", type=float, default=4.5) # Maximum utterance duration in seconds.
+    parser.add_argument("--debug-energy", action="store_true") # If enabled, print RMS energy values continuously.
+
+    parser.add_argument("--intent-bank", default="intent_bank_en.json") # Path to the intent bank JSON file.
+    parser.add_argument("--threshold", type=float, default=0.55) # MiniLM router threshold.
+
+    parser.add_argument("--speed", type=float, default=0.05, help="moveL speed (m/s) - start low for real robot") # Base linear motion speed.
+    parser.add_argument("--acc", type=float, default=0.10, help="moveL acc (m/s^2) - start low for real robot") # Base linear motion acceleration.
+    parser.add_argument("--pain-retract", type=float, default=0.03, help="PAIN retract Z (m)") # Upward retract distance used during PAIN handling.
+
+    parser.add_argument("--default-step", type=float, default=0.01, help="Default step if distance not spoken (m)") # Default movement distance if the user says a direction without a number.
+    parser.add_argument("--max-step", type=float, default=0.02, help="Clamp max step per move (m)") # Maximum allowed movement distance per command.
+    parser.add_argument("--require-move-verb", action="store_true", help="Require move/go/... verb for rule move parsing") # If enabled, a command must include a move verb to be parsed as a movement command.
+
+    parser.add_argument("--confirm-timeout", type=float, default=15, help="Seconds to wait for yes/no after parsing a move") # Time limit for motion confirmation.
+
+    # XYZ limits
+    parser.add_argument("--x-min", type=float, default=-1.0)
+    parser.add_argument("--x-max", type=float, default=+1.0)
+    parser.add_argument("--y-min", type=float, default=-1.0)
+    parser.add_argument("--y-max", type=float, default=+1.0)
+    parser.add_argument("--z-min", type=float, default=0.0)
+    parser.add_argument("--z-max", type=float, default=1.2)
+
+    args = parser.parse_args()
+
+    if args.list_devices:
+        list_audio_devices()
+        return
+
+    xyz_limits = {
+        "x": (args.x_min, args.x_max),
+        "y": (args.y_min, args.y_max),
+        "z": (args.z_min, args.z_max),
+    }
+
+    metrics = None
+    listener = None
+    rtde_c = None
+    rtde_r = None
+
+    # Briefing + ASR mute gate
+    tts_gate = threading.Event()
+    briefing = None
+
+    def announce(text: str):
+        """
+        BriefingSystem.announce()를 안전하게 감싸서
+        - TTS 시작 직전부터 ASR mute
+        - 말 끝나면 자동으로 unmute
+        """
+        nonlocal briefing, tts_gate
+        if briefing is None:
+            print(f"[Briefing (None)] {text}")
+            return
+
+        if getattr(briefing, "tts", None) is None:
+            briefing.announce(text)
+            return
+
+        if getattr(briefing, "is_speaking", False):
+            return
+
+        tts_gate.set()
+        briefing.announce(text)
+
+        def _watch_and_unmute():
+            t0 = time.time()
+            while time.time() - t0 < 0.5 and not getattr(briefing, "is_speaking", False):
+                time.sleep(0.01)
+
+            while getattr(briefing, "is_speaking", False):
+                time.sleep(0.05)
+
+            tts_gate.clear()
+
+        threading.Thread(target=_watch_and_unmute, daemon=True).start()
+
+    try:
+        # Briefing init (실패해도 프로그램은 계속)
+        try:
+            briefing = BriefingSystem()
+        except Exception as e:
+            briefing = None
+            print("[Briefing INIT ERROR]", repr(e))
+
+        metrics_path = os.path.join("logs", f"metrics_{datetime.now():%Y%m%d_%H%M%S}.csv")
+        metrics = MetricsCSV(metrics_path)
+        metrics.log(kind="startup", step="start", duration_ms=0, note=f"csv={metrics_path}")
+
+        print("=== CONFIG ===")
+        print("HOST:", args.host, "| use_urcap:", args.use_urcap)
+        print("DRY_RUN:", args.dry_run)
+        print("Audio device:", args.device, "| sr:", args.sr)
+        print("Whisper model:", args.model, "| lang:", args.lang)
+        print("chunk_ms:", args.chunk_ms, "| energy:", args.energy, "| debug_energy:", args.debug_energy)
+        print("speed/acc:", args.speed, args.acc, "| pain_retract:", args.pain_retract)
+        print("default_step/max_step:", args.default_step, args.max_step, "| require_move_verb:", args.require_move_verb)
+        print("confirm_timeout:", args.confirm_timeout)
+        print("XYZ limits:", xyz_limits)
+        print("intent bank:", args.intent_bank, "| threshold:", args.threshold)
+        print("=============\n")
+
+        # (추천) 포트 체크
+        print("[NET] Checking ports ...")
+        dash_ok = tcp_connectable(args.host, 29999, timeout_s=1.5)
+        rtde_ok = tcp_connectable(args.host, 30004, timeout_s=1.5)
+        print(f"[NET] {args.host}:29999 dashboard -> {'OK' if dash_ok else 'FAIL'}")
+        print(f"[NET] {args.host}:30004 RTDE      -> {'OK' if rtde_ok else 'FAIL'}\n")
+        metrics.log(kind="startup", step="net_check", duration_ms=0, note=f"29999={dash_ok},30004={rtde_ok}")
+
+        # ASR 로드
+        print("[ASR] Loading Whisper:", args.model)
+        t0 = perf_counter()
+        asr = whisper.load_model(args.model)
+        metrics.log(kind="startup", step="load_whisper", duration_ms=(perf_counter() - t0) * 1000.0, note=args.model)
+
+        # NLU 로드
+        print("[NLU] Loading intent bank + MiniLM retriever/router...")
+        t0 = perf_counter()
+        intent_bank = load_intent_bank(args.intent_bank)
+        metrics.log(kind="startup", step="load_intent_bank", duration_ms=(perf_counter() - t0) * 1000.0, note=args.intent_bank)
+
+        t0 = perf_counter()
+        retriever = MiniLMRetriever(intent_bank)
+        router = IntentRouter(retriever, threshold=args.threshold)
+        metrics.log(
+            kind="startup",
+            step="init_minilm_router",
+            duration_ms=(perf_counter() - t0) * 1000.0,
+            note=f"threshold={args.threshold}",
+        )
+
+        # RTDE 연결
+        print("[RTDE] Connecting to:", args.host)
+        t0 = perf_counter()
+        rtde_c = make_rtde_control(args.host, use_urcap=args.use_urcap)
+        rtde_r = rtde_receive.RTDEReceiveInterface(args.host)
+        metrics.log(kind="startup", step="connect_rtde", duration_ms=(perf_counter() - t0) * 1000.0, note=args.host)
+
+        state = {
+            "armed": False,
+            "speed_scale": 1.0,
+            "pending_move": None,  # (dx,dy,dz,dir,dist_m,orig_text)
+            "pending_t0": 0.0,
+        }
+
+        print(
+            "\nRealtime listening... (Ctrl+C to quit)\n"
+            "- Say 'start' to arm\n"
+            "- Say 'stop' to stop+disarm\n"
+            "- Say 'disarm' to disarm\n"
+            "- Say 'it hurts' to trigger PAIN behavior\n"
+            "- Try: 'move up 5 mm', 'move forward 1 cm'\n"
+            "- RULE_MOVE는 파싱 후 'yes/confirm'을 말해야 실행됩니다.\n"
+        )
+
+        # 시작 안내 (TTS)
+        announce("System ready. Say start to arm.")
+
+        listener = RealtimeWhisper(
+            asr,
+            sample_rate=args.sr,
+            input_device=args.device,
+            chunk_ms=args.chunk_ms,
+            energy_threshold=args.energy,
+            min_speech_sec=args.min_speech,
+            end_silence_sec=args.end_silence,
+            max_utt_sec=args.max_utt,
+            debug_energy=args.debug_energy,
+            language=args.lang,
+            mute_event=tts_gate,
+        )
+        listener.start()
+
+        utt_id = 0
+
+        for text in listener.listen_texts():
+            utt_id += 1
+            asr_ms = float(getattr(listener, "last_asr_ms", 0.0) or 0.0)
+
+            print("[TEXT]", text if text else "(empty)")
+            if not text:
+                metrics.log(kind="utterance", step="empty_text", utt_id=utt_id, duration_ms=0, asr_ms=asr_ms, text="")
+                continue
+
+            tl = text.lower()
+
+            # 1) 안전 키워드 override 최우선
+            t0 = perf_counter()
+            ov = override_safety(text)
+            ov_ms = (perf_counter() - t0) * 1000.0
+            if ov:
+                t1 = perf_counter()
+                handle_intent(
+                    ov,
+                    rtde_c,
+                    rtde_r,
+                    state,
+                    base_speed=args.speed,
+                    base_acc=args.acc,
+                    pain_retract_z_m=args.pain_retract,
+                    xyz_limits=xyz_limits,
+                    dry_run=args.dry_run,
+                    announce=announce,
+                )
+                act_ms = (perf_counter() - t1) * 1000.0
+                metrics.log(
+                    kind="utterance",
+                    step="override",
+                    utt_id=utt_id,
+                    duration_ms=f"{ov_ms:.3f}",
+                    asr_ms=f"{asr_ms:.3f}",
+                    text=text,
+                    override_intent=ov,
+                    chosen_intent=ov,
+                    note=f"action_ms={act_ms:.3f}, armed={state['armed']}, speed_scale={state['speed_scale']}",
+                )
+                print("[STATE]", state, "\n")
+                continue
+
+            # 2) pending move 확인 단계(yes/no)
+            if state.get("pending_move") is not None:
+                if (perf_counter() - state["pending_t0"]) > float(args.confirm_timeout):
+                    print("[CONFIRM] timeout -> cancel pending move\n")
+                    announce("Confirmation timeout. Cancelled.")
+                    metrics.log(
+                        kind="utterance",
+                        step="pending_timeout_cancel",
+                        utt_id=utt_id,
+                        duration_ms=0,
+                        asr_ms=f"{asr_ms:.3f}",
+                        text=text,
+                        chosen_intent="PENDING_CANCEL",
+                        note="timeout",
+                    )
+                    state["pending_move"] = None
+                    continue
+
+                if any(k in tl for k in CONFIRM_NO):
+                    print("[CONFIRM] canceled\n")
+                    announce("Cancelled.")
+                    metrics.log(
+                        kind="utterance",
+                        step="pending_cancel",
+                        utt_id=utt_id,
+                        duration_ms=0,
+                        asr_ms=f"{asr_ms:.3f}",
+                        text=text,
+                        chosen_intent="PENDING_CANCEL",
+                        note="user_said_no",
+                    )
+                    state["pending_move"] = None
+                    continue
+
+                if any(k in tl for k in CONFIRM_YES):
+                    if not state["armed"]:
+                        print("[BLOCKED] Not armed. Say 'start' first.\n")
+                        announce("Not armed. Say start first.")
+                        metrics.log(
+                            kind="utterance",
+                            step="pending_confirm_blocked_not_armed",
+                            utt_id=utt_id,
+                            duration_ms=0,
+                            asr_ms=f"{asr_ms:.3f}",
+                            text=text,
+                            chosen_intent="PENDING_CONFIRM",
+                            note="blocked:not_armed",
+                        )
+                        state["pending_move"] = None
+                        continue
+
+                    dx, dy, dz, found_dir, dist_m, orig_text = state["pending_move"]
+                    state["pending_move"] = None
+
+                    speed = args.speed * state["speed_scale"]
+                    acc = args.acc * state["speed_scale"]
+
+                    print(f"[CONFIRMED] executing move: dir={found_dir} dist={dist_m:.3f}m")
+                    announce("Confirmed. Executing move.")
+                    t1 = perf_counter()
+                    ok = moveL_delta(rtde_c, rtde_r, dx, dy, dz, speed, acc, xyz_limits, args.dry_run)
+                    move_ms = (perf_counter() - t1) * 1000.0
+
+                    metrics.log(
+                        kind="utterance",
+                        step="rule_move_confirmed",
+                        utt_id=utt_id,
+                        duration_ms=f"{move_ms:.3f}",
+                        asr_ms=f"{asr_ms:.3f}",
+                        text=orig_text,
+                        chosen_intent="RULE_MOVE",
+                        note=f"confirmed_by={text} ok={ok} dx={dx:.3f} dy={dy:.3f} dz={dz:.3f} speed={speed:.3f}",
+                    )
+
+                    print("moveL ok:", ok, "\n")
+                    continue
+
+                print("[CONFIRM] Waiting for 'yes/confirm' or 'no/cancel'...\n")
+                metrics.log(
+                    kind="utterance",
+                    step="pending_wait",
+                    utt_id=utt_id,
+                    duration_ms=0,
+                    asr_ms=f"{asr_ms:.3f}",
+                    text=text,
+                    chosen_intent="PENDING_WAIT",
+                    note="not_yes_no",
+                )
+                continue
+
+            # 3) 규칙 기반 move 파싱(먼저) -> pending으로 보관
+            t0 = perf_counter()
+            parsed = parse_move_command(
+                text,
+                default_step_m=float(args.default_step),
+                max_step_m=float(args.max_step),
+                require_move_verb=bool(args.require_move_verb),
+            )
+            parse_ms = (perf_counter() - t0) * 1000.0
+
+            if parsed:
+                if not state["armed"]:
+                    metrics.log(
+                        kind="utterance",
+                        step="rule_move_blocked_not_armed",
+                        utt_id=utt_id,
+                        duration_ms=f"{parse_ms:.3f}",
+                        asr_ms=f"{asr_ms:.3f}",
+                        text=text,
+                        chosen_intent="RULE_MOVE",
+                        note="blocked:not_armed",
+                    )
+                    print("[BLOCKED] Not armed. Say 'start' first.\n")
+                    announce("Not armed. Say start first.")
+                    continue
+
+                dx, dy, dz, found_dir, dist_m = parsed
+                state["pending_move"] = (dx, dy, dz, found_dir, dist_m, text)
+                state["pending_t0"] = perf_counter()
+
+                metrics.log(
+                    kind="utterance",
+                    step="rule_move_parsed_pending",
+                    utt_id=utt_id,
+                    duration_ms=f"{parse_ms:.3f}",
+                    asr_ms=f"{asr_ms:.3f}",
+                    text=text,
+                    chosen_intent="RULE_MOVE_PENDING",
+                    note=f"dir={found_dir} dist={dist_m:.3f} dx={dx:.3f} dy={dy:.3f} dz={dz:.3f}",
+                )
+
+                print(f"[RULE_MOVE] Parsed dir={found_dir} dist={dist_m:.3f}m -> dx={dx:.3f} dy={dy:.3f} dz={dz:.3f}")
+                print("[CONFIRM] Say 'yes/confirm' to execute, or 'no/cancel' to abort.\n")
+                announce("Move parsed. Say confirm to execute, or cancel.")
+                continue
+
+            # 4) MiniLM intent 라우팅
+            t0 = perf_counter()
+            chosen, candidates = router.route(text)
+            route_ms = (perf_counter() - t0) * 1000.0
+            top3 = top3_str(candidates)
+
+            print("\n[Top-3 candidates]")
+            for c in candidates[:3]:
+                print(f"- {c['intent']:10s} score={c['score']:.3f} ({c['text']})")
+
+            if not chosen:
+                metrics.log(
+                    kind="utterance",
+                    step="route_no_intent",
+                    utt_id=utt_id,
+                    duration_ms=f"{route_ms:.3f}",
+                    asr_ms=f"{asr_ms:.3f}",
+                    text=text,
+                    top3=top3,
+                    note="below_threshold",
+                )
+                print("\n[NO_INTENT] below threshold\n")
+                continue
+
+            intent = chosen["intent"]
+            score = chosen.get("score", "")
+
+            print("\n[CHOSEN]", chosen)
+
+            # 안전 intent는 armed 여부와 관계 없이 처리
+            if intent in ["PAIN", "STOP", "START", "DISARM"]:
+                t1 = perf_counter()
+                handle_intent(
+                    intent,
+                    rtde_c,
+                    rtde_r,
+                    state,
+                    base_speed=args.speed,
+                    base_acc=args.acc,
+                    pain_retract_z_m=args.pain_retract,
+                    xyz_limits=xyz_limits,
+                    dry_run=args.dry_run,
+                    announce=announce,
+                )
+                act_ms = (perf_counter() - t1) * 1000.0
+
+                metrics.log(
+                    kind="utterance",
+                    step="route_intent_safety",
+                    utt_id=utt_id,
+                    duration_ms=f"{route_ms:.3f}",
+                    asr_ms=f"{asr_ms:.3f}",
+                    text=text,
+                    chosen_intent=intent,
+                    chosen_score=score,
+                    top3=top3,
+                    note=f"action_ms={act_ms:.3f}, armed={state['armed']}, speed_scale={state['speed_scale']}",
+                )
+
+                print("[STATE]", state, "\n")
+                continue
+
+            # 나머지는 start(armed) 이후에만 실행
+            if not state["armed"]:
+                metrics.log(
+                    kind="utterance",
+                    step="route_intent_blocked_not_armed",
+                    utt_id=utt_id,
+                    duration_ms=f"{route_ms:.3f}",
+                    asr_ms=f"{asr_ms:.3f}",
+                    text=text,
+                    chosen_intent=intent,
+                    chosen_score=score,
+                    top3=top3,
+                    note="blocked:not_armed",
+                )
+                print("[BLOCKED] Not armed. Say 'start' first.\n")
+                announce("Not armed. Say start first.")
+                continue
+
+            t1 = perf_counter()
+            handle_intent(
+                intent,
+                rtde_c,
+                rtde_r,
+                state,
+                base_speed=args.speed,
+                base_acc=args.acc,
+                pain_retract_z_m=args.pain_retract,
+                xyz_limits=xyz_limits,
+                dry_run=args.dry_run,
+                announce=announce,
+            )
+            act_ms = (perf_counter() - t1) * 1000.0
+
+            metrics.log(
+                kind="utterance",
+                step="route_intent",
+                utt_id=utt_id,
+                duration_ms=f"{route_ms:.3f}",
+                asr_ms=f"{asr_ms:.3f}",
+                text=text,
+                chosen_intent=intent,
+                chosen_score=score,
+                top3=top3,
+                note=f"action_ms={act_ms:.3f}, armed={state['armed']}, speed_scale={state['speed_scale']}",
+            )
+
+            print("[STATE]", state, "\n")
+
+    except KeyboardInterrupt:
+        print("\n[QUIT] Ctrl+C")
+        if metrics:
+            metrics.log(kind="startup", step="keyboard_interrupt", duration_ms=0)
+    except Exception as e:
+        print("\n[ERROR]", repr(e))
+        if metrics:
+            metrics.log(kind="startup", step="exception", duration_ms=0, note=repr(e))
+        raise
+    finally:
+        if listener:
+            listener.stop()
+        if rtde_c:
+            try:
+                rtde_c.stopScript()
+
+            except Exception:
+                pass
+        if briefing:
+            try:
+                briefing.wait_until_finished()
+            except Exception:
+                pass
+        if metrics:
+            metrics.log(kind="startup", step="end", duration_ms=0)
+            metrics.close()
+        print("[RTDE] Closed")
+
+
+if __name__ == "__main__":
+    main()
