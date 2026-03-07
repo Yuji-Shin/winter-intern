@@ -447,8 +447,8 @@ def moveL_delta(rtde_c, rtde_r, dx, dy, dz, speed, acc, xyz_limits, dry_run: boo
     pose = rtde_r.getActualTCPPose()  # read robot current location
     print("current TCP pose:", pose)
 
-    target = pose.copy()
-    target[0] += float(dx)
+    target = pose.copy() # current robot location
+    target[0] += float(dx) # update robot location
     target[1] += float(dy)
     target[2] += float(dz)
     target = clamp_pose_xyz(target, xyz_limits) # prevent the robot from exceeding a specified limit within the function
@@ -459,7 +459,7 @@ def moveL_delta(rtde_c, rtde_r, dx, dy, dz, speed, acc, xyz_limits, dry_run: boo
         print("[DRY_RUN] skip moveL")
         return True
 
-    ok = rtde_c.moveL(target, speed, acc)
+    ok = rtde_c.moveL(target, speed, acc) # Control the actual robot movement. Return whether the command was executed.
     return ok
 
 
@@ -467,26 +467,26 @@ def handle_intent(
     intent: str,
     rtde_c,
     rtde_r,
-    state,
+    state, # current robot state
     base_speed,
     base_acc,
-    pain_retract_z_m,
+    pain_retract_z_m, # Z-axis movement distance when the intent is pain.
     xyz_limits,
     dry_run,
     announce: Optional[Callable[[str], None]] = None,
 ):
     """
-    intent -> 로봇 동작/상태 변경
-    state: dict (armed, speed_scale, pending_move...)
-    announce: TTS/briefing 안내 함수(없으면 None)
+   intent → robot action or state change
+   state: dictionary containing robot states (e.g., armed, speed_scale, pending_move, ...)
+   announce: TTS / briefing announcement function (None if unavailable)
     """
-    intent = (intent or "").upper()
+    intent = (intent or "").upper() # input generalization
 
     if intent in ("STOP", "DISARM"):
         print("[INTENT] STOP/DISARM -> stopping + disarming")
         safe_stop(rtde_c)
-        state["armed"] = False
-        state["pending_move"] = None
+        state["armed"] = False # robot system off
+        state["pending_move"] = None # Delete the pending command
         if announce:
             announce("Stopping. Disarmed.")
         return
@@ -503,7 +503,7 @@ def handle_intent(
         if announce:
             announce("Stopping. Retracting. Disarming.")
         safe_stop(rtde_c)
-        time.sleep(0.1)
+        time.sleep(0.1) # Wait until the robot completely stops
 
         retract_speed = base_speed * 0.5
         retract_acc = base_acc * 0.5
@@ -547,15 +547,19 @@ def top3_str(candidates):
         return " | ".join([f"{c['intent']}:{c['score']:.3f}" for c in candidates[:3]])
     except Exception:
         return ""
+# extract top 3 from 'candidates(list)'
 
 
 def make_rtde_control(host: str, use_urcap: bool):
     """
-    환경에 따라 flags 인자가 없을 수도 있어서 안전하게 생성.
+    Safely create flags since it may not exist depending on the environment.
     """
-    if use_urcap and hasattr(rtde_control, "FLAG_USE_EXT_UR_CAP"):
-        return rtde_control.RTDEControlInterface(host, flags=rtde_control.FLAG_USE_EXT_UR_CAP)
-    return rtde_control.RTDEControlInterface(host)
+    if use_urcap and hasattr(rtde_control, "FLAG_USE_EXT_UR_CAP"): 
+    # use_urcap: indicates whether the user chose to use URCap
+    # Check if FLAG_USE_EXT_UR_CAP exists in rtde_control.
+    # The feature works only if both conditions are satisfied.
+        return rtde_control.RTDEControlInterface(host, flags=rtde_control.FLAG_USE_EXT_UR_CAP) # Return the object with URCap activated.
+    return rtde_control.RTDEControlInterface(host) # Return the basic object 
 
 
 # ======================
