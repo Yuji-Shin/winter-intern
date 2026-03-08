@@ -1,0 +1,769 @@
+# ======================
+# main
+# ======================
+def main():
+    # Create an argument parser to read options from the command line.
+    parser = argparse.ArgumentParser()
+
+    # IP address of the real robot or URSim controller.
+    parser.add_argument("--host", default="192.168.10.11", help="Robot/URSim controller IP")
+
+    # Optional flag to use the External Control URCap connection mode.
+    parser.add_argument("--use-urcap", action="store_true", help="Use External Control URCap flag if available")
+
+    # If this flag is enabled, the program will not move the robot and will only print the target pose.
+    parser.add_argument("--dry-run", action="store_true", help="Do not execute moveL, only print target pose")
+
+    # If this flag is enabled, print available audio input devices and exit the program.
+    parser.add_argument("--list-devices", action="store_true", help="List audio input devices and exit")
+
+    # Select the microphone device index for sounddevice. None means using the default device.
+    parser.add_argument("--device", type=int, default=None, help="sounddevice input device index (None=default)")
+
+    # Set the audio sample rate for microphone input.
+    parser.add_argument("--sr", type=int, default=16000, help="Sample rate")
+
+    # Select the Whisper model size, for example tiny.en or base.en.
+    parser.add_argument("--model", default="base.en", help="Whisper model (tiny.en/base.en/...)")
+
+    # Set the language used by Whisper for speech recognition.
+    parser.add_argument("--lang", default="en", help="Whisper language")
+
+    # Length of each real-time audio chunk in milliseconds.
+    parser.add_argument("--chunk-ms", type=int, default=30, help="20~50ms recommended")
+
+    # RMS energy threshold used to roughly detect speech.
+    parser.add_argument("--energy", type=float, default=0.012, help="RMS threshold")
+
+    # Minimum speech duration required to treat input as a valid utterance.
+    parser.add_argument("--min-speech", type=float, default=0.25)
+
+    # Amount of silence required to decide that the utterance has ended.
+    parser.add_argument("--end-silence", type=float, default=0.55)
+
+    # Maximum allowed duration of one utterance.
+    parser.add_argument("--max-utt", type=float, default=4.5)
+
+    # If enabled, print audio energy values for debugging.
+    parser.add_argument("--debug-energy", action="store_true")
+
+    # Path to the intent bank JSON file used for intent matching.
+    parser.add_argument("--intent-bank", default="intent_bank_en.json")
+
+    # Similarity threshold for intent routing.
+    parser.add_argument("--threshold", type=float, default=0.55)
+
+    # Base robot movement speed for moveL.
+    parser.add_argument("--speed", type=float, default=0.05, help="moveL speed (m/s) - 실로봇은 낮게 시작 추천")
+
+    # Base robot movement acceleration for moveL.
+    parser.add_argument("--acc", type=float, default=0.10, help="moveL acc (m/s^2) - 실로봇은 낮게 시작 추천")
+
+    # Distance to retract in the Z direction when a PAIN event happens.
+    parser.add_argument("--pain-retract", type=float, default=0.03, help="PAIN retract Z (m)")
+
+    # Default movement distance when the user does not say a distance.
+    parser.add_argument("--default-step", type=float, default=0.01, help="Default step if distance not spoken (m)")
+
+    # Maximum allowed movement distance for one command.
+    parser.add_argument("--max-step", type=float, default=0.02, help="Clamp max step per move (m)")
+
+    # If enabled, a move verb like "move" or "go" must exist for rule-based parsing.
+    parser.add_argument("--require-move-verb", action="store_true", help="Require move/go/... verb for rule move parsing")
+
+    # Time limit for waiting for yes/no confirmation after a move is parsed.
+    parser.add_argument("--confirm-timeout", type=float, default=15, help="Seconds to wait for yes/no after parsing a move")
+
+    # Minimum allowed X position of the robot tool.
+    parser.add_argument("--x-min", type=float, default=-1.0)
+
+    # Maximum allowed X position of the robot tool.
+    parser.add_argument("--x-max", type=float, default=+1.0)
+
+    # Minimum allowed Y position of the robot tool.
+    parser.add_argument("--y-min", type=float, default=-1.0)
+
+    # Maximum allowed Y position of the robot tool.
+    parser.add_argument("--y-max", type=float, default=+1.0)
+
+    # Minimum allowed Z position of the robot tool.
+    parser.add_argument("--z-min", type=float, default=0.0)
+
+    # Maximum allowed Z position of the robot tool.
+    parser.add_argument("--z-max", type=float, default=1.2)
+
+    # Parse all command-line arguments and store them in args.
+    args = parser.parse_args()
+
+    # If the user only wants to see available audio devices, print them and end the program.
+    if args.list_devices:
+        list_audio_devices()
+        return
+
+    # Store workspace limits for x, y, and z in a dictionary.
+    xyz_limits = {
+        "x": (args.x_min, args.x_max),
+        "y": (args.y_min, args.y_max),
+        "z": (args.z_min, args.z_max),
+    }
+
+    # Prepare variables so they can be cleaned up safely later in finally.
+    metrics = None
+    listener = None
+    rtde_c = None
+    rtde_r = None
+
+    # Create an event object used to mute ASR while TTS is speaking.
+    tts_gate = threading.Event()
+
+    # Placeholder for the briefing/TTS system object.
+    briefing = None
+
+    # Define a helper function that safely plays a TTS announcement.
+    def announce(text: str):
+        """
+        Safely wraps BriefingSystem.announce() so that:
+        - ASR is muted right before TTS starts.
+        - ASR is automatically unmuted after TTS finishes.
+        """
+
+        # Use the briefing object and tts_gate from the outer scope.
+        nonlocal briefing, tts_gate
+
+        # If the briefing system was not created, just print the message instead.
+        if briefing is None:
+            print(f"[Briefing (None)] {text}")
+            return
+
+        # If the briefing system exists but has no TTS engine, call announce directly.
+        if getattr(briefing, "tts", None) is None:
+            briefing.announce(text)
+            return
+
+        # If TTS is already speaking, do nothing to avoid overlap.
+        if getattr(briefing, "is_speaking", False):
+            return
+
+        # Mute ASR before starting TTS.
+        tts_gate.set()
+
+        # Start speaking the given text.
+        briefing.announce(text)
+
+        # Define a background watcher that waits for TTS to finish and then unmutes ASR.
+        def _watch_and_unmute():
+            # Save the start time to limit the initial wait loop.
+            t0 = time.time()
+
+            # Wait briefly until the TTS engine actually starts speaking.
+            while time.time() - t0 < 0.5 and not getattr(briefing, "is_speaking", False):
+                time.sleep(0.01)
+
+            # Keep waiting as long as TTS is speaking.
+            while getattr(briefing, "is_speaking", False):
+                time.sleep(0.05)
+
+            # Unmute ASR after TTS ends.
+            tts_gate.clear()
+
+        # Run the watcher in a daemon thread so it does not block the main loop.
+        threading.Thread(target=_watch_and_unmute, daemon=True).start()
+
+    # Start the main protected execution block.
+    try:
+        # Try to initialize the briefing/TTS system.
+        try:
+            briefing = BriefingSystem()
+
+        # If briefing initialization fails, continue running without TTS.
+        except Exception as e:
+            briefing = None
+            print("[Briefing INIT ERROR]", repr(e))
+
+        # Create a timestamped CSV file path for logging runtime metrics.
+        metrics_path = os.path.join("logs", f"metrics_{datetime.now():%Y%m%d_%H%M%S}.csv")
+
+        # Create the metrics logger object.
+        metrics = MetricsCSV(metrics_path)
+
+        # Write the first startup log entry.
+        metrics.log(kind="startup", step="start", duration_ms=0, note=f"csv={metrics_path}")
+
+        # Print the current configuration so the user can verify the settings.
+        print("=== CONFIG ===")
+        print("HOST:", args.host, "| use_urcap:", args.use_urcap)
+        print("DRY_RUN:", args.dry_run)
+        print("Audio device:", args.device, "| sr:", args.sr)
+        print("Whisper model:", args.model, "| lang:", args.lang)
+        print("chunk_ms:", args.chunk_ms, "| energy:", args.energy, "| debug_energy:", args.debug_energy)
+        print("speed/acc:", args.speed, args.acc, "| pain_retract:", args.pain_retract)
+        print("default_step/max_step:", args.default_step, args.max_step, "| require_move_verb:", args.require_move_verb)
+        print("confirm_timeout:", args.confirm_timeout)
+        print("XYZ limits:", xyz_limits)
+        print("intent bank:", args.intent_bank, "| threshold:", args.threshold)
+        print("=============\n")
+
+        # Check whether required robot network ports are reachable.
+        print("[NET] Checking ports ...")
+
+        # Check dashboard server connectivity.
+        dash_ok = tcp_connectable(args.host, 29999, timeout_s=1.5)
+
+        # Check RTDE server connectivity.
+        rtde_ok = tcp_connectable(args.host, 30004, timeout_s=1.5)
+
+        # Print dashboard connection result.
+        print(f"[NET] {args.host}:29999 dashboard -> {'OK' if dash_ok else 'FAIL'}")
+
+        # Print RTDE connection result.
+        print(f"[NET] {args.host}:30004 RTDE      -> {'OK' if rtde_ok else 'FAIL'}\n")
+
+        # Save the network check result to the CSV log.
+        metrics.log(kind="startup", step="net_check", duration_ms=0, note=f"29999={dash_ok},30004={rtde_ok}")
+
+        # Show that Whisper ASR is starting to load.
+        print("[ASR] Loading Whisper:", args.model)
+
+        # Start timing the Whisper model loading.
+        t0 = perf_counter()
+
+        # Load the Whisper speech recognition model.
+        asr = whisper.load_model(args.model)
+
+        # Save the Whisper loading time to the CSV log.
+        metrics.log(kind="startup", step="load_whisper", duration_ms=(perf_counter() - t0) * 1000.0, note=args.model)
+
+        # Show that the intent bank and MiniLM router are starting to load.
+        print("[NLU] Loading intent bank + MiniLM retriever/router...")
+
+        # Start timing the intent bank loading.
+        t0 = perf_counter()
+
+        # Load the intent examples from the JSON file.
+        intent_bank = load_intent_bank(args.intent_bank)
+
+        # Save the intent bank loading time to the CSV log.
+        metrics.log(kind="startup", step="load_intent_bank", duration_ms=(perf_counter() - t0) * 1000.0, note=args.intent_bank)
+
+        # Start timing the retriever/router initialization.
+        t0 = perf_counter()
+
+        # Create the MiniLM-based retriever using the loaded intent bank.
+        retriever = MiniLMRetriever(intent_bank)
+
+        # Create the intent router with the given similarity threshold.
+        router = IntentRouter(retriever, threshold=args.threshold)
+
+        # Save the router initialization time to the CSV log.
+        metrics.log(
+            kind="startup",
+            step="init_minilm_router",
+            duration_ms=(perf_counter() - t0) * 1000.0,
+            note=f"threshold={args.threshold}",
+        )
+
+        # Show that RTDE connection is starting.
+        print("[RTDE] Connecting to:", args.host)
+
+        # Start timing the RTDE connection.
+        t0 = perf_counter()
+
+        # Create the RTDE control interface.
+        rtde_c = make_rtde_control(args.host, use_urcap=args.use_urcap)
+
+        # Create the RTDE receive interface.
+        rtde_r = rtde_receive.RTDEReceiveInterface(args.host)
+
+        # Save the RTDE connection time to the CSV log.
+        metrics.log(kind="startup", step="connect_rtde", duration_ms=(perf_counter() - t0) * 1000.0, note=args.host)
+
+        # Create a runtime state dictionary for arming, speed scaling, and move confirmation.
+        state = {
+            "armed": False,          # Robot starts in a disarmed state for safety.
+            "speed_scale": 1.0,      # Default speed multiplier is 1.0.
+            "pending_move": None,    # Stores a parsed move until the user says yes/confirm.
+            "pending_t0": 0.0,       # Stores the time when the pending move was created.
+        }
+
+        # Print user instructions for operating the system.
+        print(
+            "\nRealtime listening... (Ctrl+C to quit)\n"
+            "- Say 'start' to arm\n"
+            "- Say 'stop' to stop+disarm\n"
+            "- Say 'disarm' to disarm\n"
+            "- Say 'it hurts' to trigger PAIN behavior\n"
+            "- Try: 'move up 5 mm', 'move forward 1 cm'\n"
+            "- RULE_MOVE는 파싱 후 'yes/confirm'을 말해야 실행됩니다.\n"
+        )
+
+        # Speak an initial message to tell the user the system is ready.
+        announce("System ready. Say start to arm.")
+
+        # Create the realtime Whisper listener object.
+        listener = RealtimeWhisper(
+            asr,                              # ASR model object.
+            sample_rate=args.sr,              # Audio sample rate.
+            input_device=args.device,         # Microphone device index.
+            chunk_ms=args.chunk_ms,           # Audio chunk length.
+            energy_threshold=args.energy,     # Simple VAD threshold.
+            min_speech_sec=args.min_speech,   # Minimum speech length.
+            end_silence_sec=args.end_silence, # Silence needed to end an utterance.
+            max_utt_sec=args.max_utt,         # Maximum utterance length.
+            debug_energy=args.debug_energy,   # Whether to print energy values.
+            language=args.lang,               # Whisper language setting.
+            mute_event=tts_gate,              # Mute ASR while TTS is speaking.
+        )
+
+        # Start microphone listening in the background.
+        listener.start()
+
+        # Initialize utterance ID counter.
+        utt_id = 0
+
+        # Repeatedly receive transcribed text from the listener.
+        for text in listener.listen_texts():
+            # Increase the utterance counter for each new recognized text.
+            utt_id += 1
+
+            # Read the latest ASR processing time from the listener object.
+            asr_ms = float(getattr(listener, "last_asr_ms", 0.0) or 0.0)
+
+            # Print the recognized text.
+            print("[TEXT]", text if text else "(empty)")
+
+            # If the text is empty, log it and skip the rest of this loop.
+            if not text:
+                metrics.log(kind="utterance", step="empty_text", utt_id=utt_id, duration_ms=0, asr_ms=asr_ms, text="")
+                continue
+
+            # Make a lowercase version for easier keyword matching.
+            tl = text.lower()
+
+            # -------------------------------------------------
+            # 1) Safety override is checked first with highest priority.
+            # -------------------------------------------------
+
+            # Start timing the safety override check.
+            t0 = perf_counter()
+
+            # Detect whether the text matches an emergency/safety intent.
+            ov = override_safety(text)
+
+            # Calculate the safety override check time.
+            ov_ms = (perf_counter() - t0) * 1000.0
+
+            # If a safety override intent is found, handle it immediately.
+            if ov:
+                # Start timing the actual safety action.
+                t1 = perf_counter()
+
+                # Execute the safety intent.
+                handle_intent(
+                    ov,
+                    rtde_c,
+                    rtde_r,
+                    state,
+                    base_speed=args.speed,
+                    base_acc=args.acc,
+                    pain_retract_z_m=args.pain_retract,
+                    xyz_limits=xyz_limits,
+                    dry_run=args.dry_run,
+                    announce=announce,
+                )
+
+                # Measure how long the action took.
+                act_ms = (perf_counter() - t1) * 1000.0
+
+                # Save the override event to the CSV log.
+                metrics.log(
+                    kind="utterance",
+                    step="override",
+                    utt_id=utt_id,
+                    duration_ms=f"{ov_ms:.3f}",
+                    asr_ms=f"{asr_ms:.3f}",
+                    text=text,
+                    override_intent=ov,
+                    chosen_intent=ov,
+                    note=f"action_ms={act_ms:.3f}, armed={state['armed']}, speed_scale={state['speed_scale']}",
+                )
+
+                # Print the current internal state.
+                print("[STATE]", state, "\n")
+
+                # Skip the rest of the loop because this utterance is already handled.
+                continue
+
+            # -------------------------------------------------
+            # 2) If a move is waiting for confirmation, process yes/no first.
+            # -------------------------------------------------
+
+            # Check whether there is a pending move waiting for confirmation.
+            if state.get("pending_move") is not None:
+                # If too much time has passed, cancel the pending move automatically.
+                if (perf_counter() - state["pending_t0"]) > float(args.confirm_timeout):
+                    print("[CONFIRM] timeout -> cancel pending move\n")
+                    announce("Confirmation timeout. Cancelled.")
+                    metrics.log(
+                        kind="utterance",
+                        step="pending_timeout_cancel",
+                        utt_id=utt_id,
+                        duration_ms=0,
+                        asr_ms=f"{asr_ms:.3f}",
+                        text=text,
+                        chosen_intent="PENDING_CANCEL",
+                        note="timeout",
+                    )
+                    state["pending_move"] = None
+                    continue
+
+                # If the user said a negative confirmation word, cancel the move.
+                if any(k in tl for k in CONFIRM_NO):
+                    print("[CONFIRM] canceled\n")
+                    announce("Cancelled.")
+                    metrics.log(
+                        kind="utterance",
+                        step="pending_cancel",
+                        utt_id=utt_id,
+                        duration_ms=0,
+                        asr_ms=f"{asr_ms:.3f}",
+                        text=text,
+                        chosen_intent="PENDING_CANCEL",
+                        note="user_said_no",
+                    )
+                    state["pending_move"] = None
+                    continue
+
+                # If the user said a positive confirmation word, execute the move.
+                if any(k in tl for k in CONFIRM_YES):
+                    # For safety, block the move if the robot is not armed.
+                    if not state["armed"]:
+                        print("[BLOCKED] Not armed. Say 'start' first.\n")
+                        announce("Not armed. Say start first.")
+                        metrics.log(
+                            kind="utterance",
+                            step="pending_confirm_blocked_not_armed",
+                            utt_id=utt_id,
+                            duration_ms=0,
+                            asr_ms=f"{asr_ms:.3f}",
+                            text=text,
+                            chosen_intent="PENDING_CONFIRM",
+                            note="blocked:not_armed",
+                        )
+                        state["pending_move"] = None
+                        continue
+
+                    # Unpack the saved move information.
+                    dx, dy, dz, found_dir, dist_m, orig_text = state["pending_move"]
+
+                    # Clear the pending move because it is now being handled.
+                    state["pending_move"] = None
+
+                    # Apply the current speed scaling to the base speed.
+                    speed = args.speed * state["speed_scale"]
+
+                    # Apply the current speed scaling to the base acceleration.
+                    acc = args.acc * state["speed_scale"]
+
+                    # Print information about the confirmed move.
+                    print(f"[CONFIRMED] executing move: dir={found_dir} dist={dist_m:.3f}m")
+
+                    # Speak a confirmation message.
+                    announce("Confirmed. Executing move.")
+
+                    # Start timing the move execution.
+                    t1 = perf_counter()
+
+                    # Send the move command to the robot.
+                    ok = moveL_delta(rtde_c, rtde_r, dx, dy, dz, speed, acc, xyz_limits, args.dry_run)
+
+                    # Measure the move execution time.
+                    move_ms = (perf_counter() - t1) * 1000.0
+
+                    # Save the confirmed move event to the CSV log.
+                    metrics.log(
+                        kind="utterance",
+                        step="rule_move_confirmed",
+                        utt_id=utt_id,
+                        duration_ms=f"{move_ms:.3f}",
+                        asr_ms=f"{asr_ms:.3f}",
+                        text=orig_text,
+                        chosen_intent="RULE_MOVE",
+                        note=f"confirmed_by={text} ok={ok} dx={dx:.3f} dy={dy:.3f} dz={dz:.3f} speed={speed:.3f}",
+                    )
+
+                    # Print whether the move succeeded.
+                    print("moveL ok:", ok, "\n")
+
+                    # Skip the rest of the loop because this utterance is already handled.
+                    continue
+
+                # If the user said something other than yes/no, keep waiting.
+                print("[CONFIRM] Waiting for 'yes/confirm' or 'no/cancel'...\n")
+                metrics.log(
+                    kind="utterance",
+                    step="pending_wait",
+                    utt_id=utt_id,
+                    duration_ms=0,
+                    asr_ms=f"{asr_ms:.3f}",
+                    text=text,
+                    chosen_intent="PENDING_WAIT",
+                    note="not_yes_no",
+                )
+                continue
+
+            # -------------------------------------------------
+            # 3) Rule-based move parsing is checked before MiniLM routing.
+            # -------------------------------------------------
+
+            # Start timing the move-command parsing.
+            t0 = perf_counter()
+
+            # Try to parse a direct move command like "move up 5 mm".
+            parsed = parse_move_command(
+                text,
+                default_step_m=float(args.default_step),
+                max_step_m=float(args.max_step),
+                require_move_verb=bool(args.require_move_verb),
+            )
+
+            # Measure the parsing time.
+            parse_ms = (perf_counter() - t0) * 1000.0
+
+            # If a valid rule-based move was parsed, save it as pending.
+            if parsed:
+                # Block move execution if the robot is not armed yet.
+                if not state["armed"]:
+                    metrics.log(
+                        kind="utterance",
+                        step="rule_move_blocked_not_armed",
+                        utt_id=utt_id,
+                        duration_ms=f"{parse_ms:.3f}",
+                        asr_ms=f"{asr_ms:.3f}",
+                        text=text,
+                        chosen_intent="RULE_MOVE",
+                        note="blocked:not_armed",
+                    )
+                    print("[BLOCKED] Not armed. Say 'start' first.\n")
+                    announce("Not armed. Say start first.")
+                    continue
+
+                # Unpack the parsed movement values.
+                dx, dy, dz, found_dir, dist_m = parsed
+
+                # Save the parsed move so it can be confirmed later.
+                state["pending_move"] = (dx, dy, dz, found_dir, dist_m, text)
+
+                # Record the time when the pending move was created.
+                state["pending_t0"] = perf_counter()
+
+                # Save the pending move information to the CSV log.
+                metrics.log(
+                    kind="utterance",
+                    step="rule_move_parsed_pending",
+                    utt_id=utt_id,
+                    duration_ms=f"{parse_ms:.3f}",
+                    asr_ms=f"{asr_ms:.3f}",
+                    text=text,
+                    chosen_intent="RULE_MOVE_PENDING",
+                    note=f"dir={found_dir} dist={dist_m:.3f} dx={dx:.3f} dy={dy:.3f} dz={dz:.3f}",
+                )
+
+                # Print the parsed move for debugging and transparency.
+                print(f"[RULE_MOVE] Parsed dir={found_dir} dist={dist_m:.3f}m -> dx={dx:.3f} dy={dy:.3f} dz={dz:.3f}")
+
+                # Ask the user to confirm or cancel the move.
+                print("[CONFIRM] Say 'yes/confirm' to execute, or 'no/cancel' to abort.\n")
+
+                # Speak the confirmation request.
+                announce("Move parsed. Say confirm to execute, or cancel.")
+
+                # Skip the rest of the loop because this utterance is already handled.
+                continue
+
+            # -------------------------------------------------
+            # 4) If no rule-based move was found, use MiniLM intent routing.
+            # -------------------------------------------------
+
+            # Start timing the intent routing step.
+            t0 = perf_counter()
+
+            # Route the text to the most likely intent and also get candidate scores.
+            chosen, candidates = router.route(text)
+
+            # Measure the routing time.
+            route_ms = (perf_counter() - t0) * 1000.0
+
+            # Convert the top 3 candidates into a string for logging.
+            top3 = top3_str(candidates)
+
+            # Print the top 3 most similar candidate intents.
+            print("\n[Top-3 candidates]")
+            for c in candidates[:3]:
+                print(f"- {c['intent']:10s} score={c['score']:.3f} ({c['text']})")
+
+            # If no intent passes the threshold, log it and do nothing.
+            if not chosen:
+                metrics.log(
+                    kind="utterance",
+                    step="route_no_intent",
+                    utt_id=utt_id,
+                    duration_ms=f"{route_ms:.3f}",
+                    asr_ms=f"{asr_ms:.3f}",
+                    text=text,
+                    top3=top3,
+                    note="below_threshold",
+                )
+                print("\n[NO_INTENT] below threshold\n")
+                continue
+
+            # Get the selected intent name.
+            intent = chosen["intent"]
+
+            # Get the selected intent score.
+            score = chosen.get("score", "")
+
+            # Print the selected intent dictionary.
+            print("\n[CHOSEN]", chosen)
+
+            # Safety-related intents are always allowed even when the robot is not armed.
+            if intent in ["PAIN", "STOP", "START", "DISARM"]:
+                # Start timing the action.
+                t1 = perf_counter()
+
+                # Execute the safety intent.
+                handle_intent(
+                    intent,
+                    rtde_c,
+                    rtde_r,
+                    state,
+                    base_speed=args.speed,
+                    base_acc=args.acc,
+                    pain_retract_z_m=args.pain_retract,
+                    xyz_limits=xyz_limits,
+                    dry_run=args.dry_run,
+                    announce=announce,
+                )
+
+                # Measure how long the action took.
+                act_ms = (perf_counter() - t1) * 1000.0
+
+                # Save the routed safety intent to the CSV log.
+                metrics.log(
+                    kind="utterance",
+                    step="route_intent_safety",
+                    utt_id=utt_id,
+                    duration_ms=f"{route_ms:.3f}",
+                    asr_ms=f"{asr_ms:.3f}",
+                    text=text,
+                    chosen_intent=intent,
+                    chosen_score=score,
+                    top3=top3,
+                    note=f"action_ms={act_ms:.3f}, armed={state['armed']}, speed_scale={state['speed_scale']}",
+                )
+
+                # Print the current internal state.
+                print("[STATE]", state, "\n")
+
+                # Skip the rest of the loop because this utterance is already handled.
+                continue
+
+            # For all other intents, the robot must already be armed.
+            if not state["armed"]:
+                metrics.log(
+                    kind="utterance",
+                    step="route_intent_blocked_not_armed",
+                    utt_id=utt_id,
+                    duration_ms=f"{route_ms:.3f}",
+                    asr_ms=f"{asr_ms:.3f}",
+                    text=text,
+                    chosen_intent=intent,
+                    chosen_score=score,
+                    top3=top3,
+                    note="blocked:not_armed",
+                )
+                print("[BLOCKED] Not armed. Say 'start' first.\n")
+                announce("Not armed. Say start first.")
+                continue
+
+            # Start timing the normal intent action.
+            t1 = perf_counter()
+
+            # Execute the selected normal intent.
+            handle_intent(
+                intent,
+                rtde_c,
+                rtde_r,
+                state,
+                base_speed=args.speed,
+                base_acc=args.acc,
+                pain_retract_z_m=args.pain_retract,
+                xyz_limits=xyz_limits,
+                dry_run=args.dry_run,
+                announce=announce,
+            )
+
+            # Measure how long the action took.
+            act_ms = (perf_counter() - t1) * 1000.0
+
+            # Save the normal routed intent to the CSV log.
+            metrics.log(
+                kind="utterance",
+                step="route_intent",
+                utt_id=utt_id,
+                duration_ms=f"{route_ms:.3f}",
+                asr_ms=f"{asr_ms:.3f}",
+                text=text,
+                chosen_intent=intent,
+                chosen_score=score,
+                top3=top3,
+                note=f"action_ms={act_ms:.3f}, armed={state['armed']}, speed_scale={state['speed_scale']}",
+            )
+
+            # Print the updated internal state.
+            print("[STATE]", state, "\n")
+
+    # Handle Ctrl+C gracefully.
+    except KeyboardInterrupt:
+        print("\n[QUIT] Ctrl+C")
+        if metrics:
+            metrics.log(kind="startup", step="keyboard_interrupt", duration_ms=0)
+
+    # Handle unexpected errors, log them, and raise them again.
+    except Exception as e:
+        print("\n[ERROR]", repr(e))
+        if metrics:
+            metrics.log(kind="startup", step="exception", duration_ms=0, note=repr(e))
+        raise
+
+    # Always run cleanup code, whether the program ended normally or with an error.
+    finally:
+        # Stop the audio listener if it was created.
+        if listener:
+            listener.stop()
+
+        # Stop the RTDE script on the robot side if the control interface exists.
+        if rtde_c:
+            try:
+                rtde_c.stopScript()
+            except Exception:
+                pass
+
+        # Wait until the briefing/TTS system finishes speaking before exiting.
+        if briefing:
+            try:
+                briefing.wait_until_finished()
+            except Exception:
+                pass
+
+        # Write the final log entry and close the CSV file.
+        if metrics:
+            metrics.log(kind="startup", step="end", duration_ms=0)
+            metrics.close()
+
+        # Print a final message showing that RTDE resources are closed.
+        print("[RTDE] Closed")
+
+
+# Run main() only when this file is executed directly.
+if __name__ == "__main__":
+    main()
