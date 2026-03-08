@@ -1,0 +1,128 @@
+# Import the os module to work with file and directory paths.
+import os
+
+# Import threading so TTS can run in a separate thread without blocking the main program.
+import threading
+
+# Import sounddevice to play generated audio through the speaker.
+import sounddevice as sd
+
+# Import the Kokoro ONNX-based TTS engine.
+from kokoro_onnx import Kokoro
+
+
+# Define a class that manages spoken briefing messages using TTS.
+class BriefingSystem:
+    # Initialize the briefing system.
+    def __init__(self):
+        # Placeholder for the TTS engine object.
+        self.tts = None
+
+        # Flag that tells whether the system is currently speaking.
+        self.is_speaking = False
+
+        # Placeholder for the speaking thread.
+        self.thread = None
+
+        # Try to locate the TTS model files and load the Kokoro engine.
+        try:
+            # Get the absolute path of the current Python file.
+            # Example: .../jeehe_project/src/briefing.py
+            current_dir = os.path.dirname(os.path.abspath(__file__))
+
+            # Move one level up from the src folder to the project root folder.
+            # Example: .../jeehe_project
+            project_root = os.path.dirname(current_dir)
+
+            # Build the full path to the ONNX model file inside the data folder.
+            model_path = os.path.join(project_root, "data", "kokoro-v1.0.onnx")
+
+            # Build the full path to the voice file inside the data folder.
+            voices_path = os.path.join(project_root, "data", "voices-v1.0.bin")
+
+            # Print the folder path being used for loading the TTS files.
+            print(f"[TTS] Loading Kokoro from: {os.path.join(project_root, 'data')}")
+
+            # Create the Kokoro TTS engine using the model and voice files.
+            self.tts = Kokoro(model_path, voices_path)
+
+            # Print a success message if the TTS engine is ready.
+            print("[TTS] Engine Ready.")
+
+        # If anything goes wrong while loading the model, handle it safely.
+        except Exception as e:
+            # Print the error message.
+            print(f"[TTS Error] 모델 로드 실패: {e}")
+
+            # Print a hint about the expected folder structure.
+            print("경로가 올바른지, data 폴더가 src 폴더 '밖에' 있는지 확인하세요.")
+
+            # Keep self.tts as None so the rest of the program does not crash.
+            self.tts = None
+
+    # Internal function that actually generates and plays speech in a background thread.
+    def _speak_thread(self, text):
+        """Internal thread function that generates and plays speech."""
+
+        # If the TTS engine is not loaded, do nothing.
+        if not self.tts:
+            return
+
+        # Mark that the system has started speaking.
+        self.is_speaking = True
+
+        try:
+            # Generate audio samples from the input text.
+            # voice: selects the speaker voice
+            # speed: controls speaking speed
+            # lang: sets the language/accent
+            samples, sr = self.tts.create(text, voice="af_sarah", speed=1.0, lang="en-us")
+
+            # Play the generated audio samples through the speaker.
+            sd.play(samples, samplerate=sr)
+
+            # Wait until the audio playback is fully finished.
+            sd.wait()
+
+        # Handle any playback or generation error safely.
+        except Exception as e:
+            # Print the playback error message.
+            print(f"[TTS Play Error] {e}")
+
+        # Always reset the speaking flag when done, even if an error occurs.
+        finally:
+            self.is_speaking = False
+
+    # Public function used by other parts of the program to request speech output.
+    def announce(self, text):
+        """Public function for asynchronous speech output."""
+
+        # If the TTS engine is unavailable, print the text instead of speaking it.
+        if self.tts is None:
+            print(f"[Briefing (No Audio)] {text}")
+            return
+
+        # If the system is already speaking, skip this request to avoid overlap.
+        if self.is_speaking:
+            return
+
+        # Print the text that will be spoken for logging/debugging.
+        print(f"[Briefing] {text}")
+
+        # Create a new thread that runs the internal speaking function.
+        self.thread = threading.Thread(target=self._speak_thread, args=(text,))
+
+        # Start the speaking thread so speech happens asynchronously.
+        self.thread.start()
+
+    # Wait until the current speech thread is completely finished.
+    def wait_until_finished(self):
+        """Wait until the current speech output is fully finished."""
+
+        # Check whether a thread exists and is still running.
+        if self.thread is not None and self.thread.is_alive():
+            # Print a message while waiting.
+            print("[TTS] Waiting for speech to finish...")
+
+            # Block until the speaking thread finishes.
+            self.thread.join()
